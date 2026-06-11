@@ -1361,16 +1361,28 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // out-of-bounds tensor read.  cache_.last_tok is always correct.
     int32_t last_tok = cache_.last_tok;
 
+    // Sampled-verify: spec decode with an active sampler. Each chain
+    // position is verified against a token drawn from the target's own
+    // sampler chain instead of its argmax, so every committed token is an
+    // exact target sample — the output distribution is identical to AR
+    // sampling. Acceptance drops vs greedy but stays far above the AR
+    // floor. Opt out with DFLASH_SAMPLED_VERIFY=0.
+    static const bool kSampledVerify = []() {
+        const char * e = std::getenv("DFLASH_SAMPLED_VERIFY");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    const bool sampled_verify = kSampledVerify && sampler_.needs_logit_processing();
+
     // Check if we can use speculative decode:
     // - draft model loaded and not parked
     // - feature mirror initialized
-    // - greedy decoding (no logit processing) — spec decode uses argmax verification
+    // - greedy decoding, or sampled-verify enabled
     const bool can_spec = cfg_.draft_path
         && !draft_parked_
         && (cfg_.remote_draft.enabled()
             ? remote_draft_.active()
             : feature_mirror_.target_feat != nullptr)
-        && !sampler_.needs_logit_processing();
+        && (!sampler_.needs_logit_processing() || sampled_verify);
 
     if (!can_spec) {
         // AR fallback consumes the final prefill position itself, then advances
@@ -1398,6 +1410,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     std::vector<int32_t> noise_ids(q_len);
     std::vector<int32_t> draft_tok(q_len);
     std::vector<int32_t> target_tok(q_len);
+    std::vector<float>   verify_logits;   // sampled-verify: [q_len x vocab]
+    std::vector<int32_t> verify_history;  // sampled-verify: penalty history
     std::vector<int32_t> pos_q(q_len);
     std::vector<int32_t> pos_k;
     std::vector<float>   local_hidden;
@@ -1580,18 +1594,49 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             return false;
         }
 
-        // 5. Acceptance: longest matching prefix between draft and target argmax
+        // 5. Acceptance. Greedy: longest matching prefix between draft and
+        // target argmax. Sampled-verify: walk the chain drawing each next
+        // token from the target's sampler chain; accept while the draft
+        // guessed the drawn token, and the first mismatch becomes the bonus
+        // token (it is already a valid target sample at that position).
         int accept_n = 1;
-        for (int i = 0; i < q_len - 1; i++) {
-            if (draft_tok[i + 1] == target_tok[i]) accept_n++;
-            else break;
+        int bonus_tok = -1;
+        if (sampled_verify) {
+            if (!target->read_verify_logits(q_len, verify_logits)) {
+                std::fprintf(stderr, "spec-decode: verify logits read failed\n");
+                target->restore_kv();
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            const int vocab_v = (int)(verify_logits.size() / (size_t)q_len);
+            verify_history = out_tokens;
+            bool mismatched = false;
+            for (int i = 0; i < q_len - 1; i++) {
+                const int s = sample_logits(
+                    verify_logits.data() + (size_t)i * vocab_v, vocab_v,
+                    sampler_, verify_history, sampler_rng_);
+                if (draft_tok[i + 1] == s) {
+                    accept_n++;
+                    verify_history.push_back(s);
+                } else {
+                    bonus_tok = s;
+                    mismatched = true;
+                    break;
+                }
+            }
+            (void)mismatched;
+        } else {
+            for (int i = 0; i < q_len - 1; i++) {
+                if (draft_tok[i + 1] == target_tok[i]) accept_n++;
+                else break;
+            }
+            bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
         }
         // Track hint acceptance telemetry.
         if (hint_fill > 0) {
             n_hint_proposed += hint_fill;
             n_hint_accepted += std::min(hint_fill, accept_n - 1);
         }
-        int bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
         int commit_n  = accept_n + (bonus_tok >= 0 ? 1 : 0);
         if (commit_n > need_commit_budget) {
             commit_n = need_commit_budget;
