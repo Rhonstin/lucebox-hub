@@ -1563,10 +1563,38 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         return true;  // handled (with error)
     }
 
-    // Check context length.
-    if ((int)req.prompt_tokens.size() + req.max_output > config_.max_ctx) {
-        send_error(fd, 400, "prompt + max_tokens exceeds context window");
-        return true;
+    // Check context length. Requests that will go through PFlash
+    // compression are exempt here and validated post-compression instead:
+    // the source prompt may exceed max_ctx by design — the target only
+    // prefills the compressed prompt.
+    const bool pflash_will_compress =
+        config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+        drafter_tokenizer_ != nullptr &&
+        json_array_size(req.tools) == 0 &&  // tool requests bypass compression
+        (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
+         (int)req.prompt_tokens.size() >= config_.pflash_threshold);
+    if (!pflash_will_compress &&
+        (int)req.prompt_tokens.size() + req.max_output > config_.max_ctx) {
+        // If the prompt itself fits, clamp max_tokens to the remaining window
+        // (clients like Letta send a fixed large max_tokens regardless of
+        // prompt size). Only reject when the prompt leaves no room at all.
+        const int room = config_.max_ctx - (int)req.prompt_tokens.size();
+        if (room >= 16) {
+            std::fprintf(stderr,
+                "[server] clamping max_tokens %d -> %d (prompt=%zu, max_ctx=%d)\n",
+                req.max_output, room, req.prompt_tokens.size(), config_.max_ctx);
+            req.max_output = room;
+        } else {
+            char err[256];
+            std::snprintf(err, sizeof(err),
+                "prompt + max_tokens exceeds context window "
+                "(prompt=%zu + max_tokens=%d > max_ctx=%d%s)",
+                req.prompt_tokens.size(), req.max_output, config_.max_ctx,
+                json_array_size(req.tools) > 0
+                    ? "; tool requests bypass PFlash compression" : "");
+            send_error(fd, 400, err);
+            return true;
+        }
     }
 
     std::fprintf(stderr,
@@ -1719,6 +1747,14 @@ void HttpServer::worker_loop() {
             } else if (config_.pflash_mode == ServerConfig::PflashMode::AUTO) {
                 should_compress = (n_prompt >= config_.pflash_threshold);
             }
+            // Tool-calling requests skip compression so JSON tool definitions
+            // stay intact (mirrors the pre-check exemption above).
+            if (should_compress && json_array_size(req.tools) > 0) {
+                std::fprintf(stderr,
+                    "[pflash] tools present (%zu) — skipping compression\n",
+                    json_array_size(req.tools));
+                should_compress = false;
+            }
 
             if (should_compress) {
                 // Check full-compress cache FIRST — if we've seen this exact
@@ -1850,6 +1886,15 @@ void HttpServer::worker_loop() {
                     }
                     if (!pflash_compressed && !compression_error.empty()) {
                         fail_request(500, compression_error);
+                        continue;
+                    }
+                    // Post-compression length check (the pre-check above is
+                    // skipped for compressed requests).
+                    if (pflash_compressed &&
+                        (int)effective_prompt.size() + req.max_output > config_.max_ctx) {
+                        fail_request(400,
+                            "compressed prompt + max_tokens still exceeds context window; "
+                            "lower --prefill-keep-ratio or raise --max-ctx");
                         continue;
                     }
                 }
@@ -2039,6 +2084,24 @@ void HttpServer::worker_loop() {
                 disk_hit = true;
                 std::fprintf(stderr, "[disk-cache] hit, loaded to slot=%d pos=%d\n",
                              DISK_STAGING_SLOT, prefix_len);
+            }
+        }
+
+        // A slot whose snapshot covers more KV than this prompt cannot be
+        // diff-prefilled (the client edited/summarized its history since the
+        // snapshot was saved). Treat as a cache miss; the backend-side
+        // fallback also guards this, but skipping restore here avoids a
+        // pointless snapshot copy-in.
+        if (using_restore) {
+            const int snap_len = backend_.snapshot_cur_pos(cache_slot);
+            if (snap_len > (int)effective_prompt.size()) {
+                std::fprintf(stderr,
+                    "[pc] slot=%d snapshot pos=%d > prompt=%zu — treating as miss\n",
+                    cache_slot, snap_len, effective_prompt.size());
+                cache_slot = -1;
+                prefix_len = 0;
+                using_restore = false;
+                disk_hit = false;
             }
         }
 
