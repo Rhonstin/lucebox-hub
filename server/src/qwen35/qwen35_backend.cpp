@@ -1757,7 +1757,23 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             // next draft step. The floor_to_ar path never reaches the next
             // iteration — it sets cache_.last_tok directly below and returns —
             // so last_tok is intentionally left untouched when flooring.
-            last_tok = replay_last_tok;
+            //
+            // Sampled-verify: the seed is committed as-is by the next step
+            // (draft_tok[0]), so it must itself be a sample from the target
+            // distribution. replay_last_tok is the argmax — seeding with it
+            // injects one greedy token per step, which biases the output and
+            // locks long generations into repetition loops.
+            if (sampled_verify && !replay_tok.empty() &&
+                target->read_verify_logits((int)replay_tok.size(), verify_logits)) {
+                const int vocab_v =
+                    (int)(verify_logits.size() / replay_tok.size());
+                last_tok = sample_logits(
+                    verify_logits.data() +
+                        (replay_tok.size() - 1) * (size_t)vocab_v,
+                    vocab_v, sampler_, out_tokens, sampler_rng_);
+            } else {
+                last_tok = replay_last_tok;
+            }
             committed += emitted;
         }
         cache_.cur_pos = committed;
