@@ -215,6 +215,7 @@ bool Qwen35Backend::init() {
     const int max_verify_tokens = cfg_.ddtree_mode
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;
+    cache_max_verify_tokens_ = max_verify_tokens;
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
@@ -454,6 +455,10 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
         step_graph_destroy(sg_);
         if (!target_parked_) park("target");
         if (!draft_parked_)  park("draft");
+        // The target KV/rollback cache is dead weight during compress —
+        // generation re-prefills the compressed prompt from scratch anyway.
+        // Freeing it buys the 136K drafter pass ~2 GB on 24 GB cards.
+        free_target_cache(cache_);
     }
 
     // Synchronize all backends to flush any outstanding async CUDA work
@@ -461,6 +466,23 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
     // target/draft streams can corrupt the drafter's allocations.
     ggml_backend_synchronize(target_backend_);
     if (draft_backend_) ggml_backend_synchronize(draft_backend_);
+
+    // Release the compute pools' dequant/workspace high-water from prior
+    // prefill/decode. Without this the 136K drafter pass OOMs on every
+    // compress after the first generation on a 24 GB card.
+    if (!req.skip_park) {
+        if (ggml_backend_is_cuda(target_backend_)) {
+            ggml_backend_cuda_pool_trim(target_backend_);
+        }
+        if (draft_backend_ && draft_backend_ != target_backend_ &&
+            ggml_backend_is_cuda(draft_backend_)) {
+            ggml_backend_cuda_pool_trim(draft_backend_);
+        }
+        size_t vfree = 0, vtotal = 0;
+        ggml_backend_cuda_get_device_memory(req.drafter_gpu, &vfree, &vtotal);
+        std::fprintf(stderr, "[compress] device %d free %.0f MiB / %.0f MiB after park+trim\n",
+                     req.drafter_gpu, vfree / 1048576.0, vtotal / 1048576.0);
+    }
 
     // Load drafter with its OWN backend (not target_backend_).
     // Matches test_dflash.cpp: separate backend supports multi-GPU
@@ -478,6 +500,7 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
             if (!req.skip_park) {
                 if (!was_target_parked) unpark("target");
                 if (!was_draft_parked)  unpark("draft");
+                restore_target_cache_after_compress();
             }
             return result;
         }
@@ -501,9 +524,23 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
     if (!req.skip_park) {
         if (!was_target_parked) unpark("target");
         if (!was_draft_parked)  unpark("draft");
+        if (!restore_target_cache_after_compress()) {
+            result.ok = false;
+        }
     }
 
     return result;
+}
+
+bool Qwen35Backend::restore_target_cache_after_compress() {
+    if (cache_.base_buf) return true;  // still alive (skip_park path)
+    if (!create_target_cache(w_, cfg_.device.max_ctx, cache_max_verify_tokens_,
+                             target_backend_, cache_, /*prefill_only=*/true)) {
+        std::fprintf(stderr, "[compress] target cache re-create failed: %s\n",
+                     dflash27b_last_error());
+        return false;
+    }
+    return true;
 }
 
 bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & io) {
@@ -763,10 +800,22 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         result.prefill_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_prefill_start).count();
     } else if (prompt_len > 0 && prompt_len < snap_pos) {
-        // Cached more than the request — should never happen in practice.
-        result.error = "snapshot_longer_than_prompt";
-        out_io.emit(-1);
-        return result;
+        // The slot's snapshot covers more KV than the new prompt (the client
+        // edited or summarized its history). Fall back to a fresh full
+        // prefill instead of failing the request with zero tokens.
+        std::fprintf(stderr,
+            "[pc] snapshot longer than prompt (snap=%d > prompt=%d) — "
+            "fresh prefill fallback\n", snap_pos, prompt_len);
+        reset_recurrent_state(cache_);
+        cache_.cur_pos = 0;
+        auto t_prefill_start = std::chrono::steady_clock::now();
+        committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
+        if (committed < 0) {
+            result.error = "prefill";
+            return result;
+        }
+        result.prefill_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_prefill_start).count();
     }
 
     // Decode

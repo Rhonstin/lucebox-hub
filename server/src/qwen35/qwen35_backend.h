@@ -124,6 +124,9 @@ public:
     // to prevent VRAM growth over time.
     void release_scratch() override;
 
+    // Re-create the target KV/rollback cache freed at the start of compress().
+    bool restore_target_cache_after_compress();
+
 protected:
     virtual bool load_target_model(ggml_backend_t backend, TargetWeights & out);
     virtual bool run_ar_decode_path(int committed, int n_gen,
@@ -168,6 +171,7 @@ private:
     TargetWeights  w_;
     DraftWeights   dw_;
     TargetCache    cache_;
+    int            cache_max_verify_tokens_ = 0;  // for cache re-creation after compress
 
     // ── Graph containers (persistent gallocr buffers) ────────────────
     StepGraph      sg_;           // target forward (verify / prefill)
