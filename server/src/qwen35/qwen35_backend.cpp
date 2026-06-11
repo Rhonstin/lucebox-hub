@@ -1396,6 +1396,31 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     }
 
     out_spec_ran = true;
+
+    // Sampled-verify: cache_.last_tok is do_prefill's argmax, and the spec
+    // loop commits it verbatim as the first generated token. The first token
+    // is the highest-entropy decision of the whole generation (e.g. "answer
+    // with text" vs "open a tool call"), so it must be sampled like every
+    // other committed token — mirror do_ar_decode's first-token sampling.
+    if (sampled_verify && out_tokens.empty() && prefill_last_logits_valid_) {
+        std::vector<float> first_logits(w_.n_vocab);
+        ggml_backend_tensor_get(sg_.logits, first_logits.data(),
+                                prefill_last_logits_offset_,
+                                sizeof(float) * (size_t)w_.n_vocab);
+        if (std::getenv("DFLASH_SV_DEBUG")) {
+            int am = 0; float best = first_logits[0];
+            for (int v = 1; v < w_.n_vocab; v++)
+                if (first_logits[v] > best) { best = first_logits[v]; am = v; }
+            std::fprintf(stderr,
+                "[sv-debug] first-token: logits_argmax=%d cache_last_tok=%d "
+                "(match=%d) top_logit=%.3f\n",
+                am, cache_.last_tok, am == cache_.last_tok, best);
+        }
+        last_tok = sample_logits(first_logits.data(), w_.n_vocab, sampler_,
+                                 out_tokens, sampler_rng_);
+        cache_.last_tok = last_tok;
+    }
+
     const int _min_floor = dflash_min_tokens_floor();
 
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
@@ -1609,6 +1634,30 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 return false;
             }
             const int vocab_v = (int)(verify_logits.size() / (size_t)q_len);
+            static const bool kSvDebug = []() {
+                const char * e = std::getenv("DFLASH_SV_DEBUG");
+                return e != nullptr && std::string(e) == "1";
+            }();
+            if (kSvDebug) {
+                // Row-alignment check: CPU argmax over each bulk-read row must
+                // equal the GPU argmax (target_tok). Divergence = misaligned
+                // or stale bulk read.
+                for (int i = 0; i < q_len; i++) {
+                    const float * row = verify_logits.data() + (size_t)i * vocab_v;
+                    int am = 0; float best = row[0];
+                    for (int v = 1; v < vocab_v; v++)
+                        if (row[v] > best) { best = row[v]; am = v; }
+                    if (am != target_tok[i]) {
+                        std::fprintf(stderr,
+                            "[sv-debug] ROW MISMATCH i=%d cpu_argmax=%d (%.3f) "
+                            "gpu_argmax=%d (%.3f) vocab_v=%d\n",
+                            i, am, best, target_tok[i],
+                            target_tok[i] < vocab_v ? row[target_tok[i]] : -999.0f,
+                            vocab_v);
+                        break;
+                    }
+                }
+            }
             verify_history = out_tokens;
             bool mismatched = false;
             for (int i = 0; i < q_len - 1; i++) {

@@ -20,6 +20,9 @@ export DFLASH_FP_CHUNK_S="${DFLASH_FP_CHUNK_S:-1024}"
 # CUDA graphs cost ~1 GB of resident VRAM here for no measurable decode gain
 # (62.9 vs 63.2 tok/s); that headroom is needed by the 136K drafter pass.
 export GGML_CUDA_DISABLE_GRAPHS="${GGML_CUDA_DISABLE_GRAPHS:-1}"
+# Sampled-verify disabled in prod while early-EOS on agent traffic is being
+# investigated (tiny outputs at temp 1.0 with tools); temp>0 falls back to AR.
+export DFLASH_SAMPLED_VERIFY="${DFLASH_SAMPLED_VERIFY:-0}"
 # Disable pre-RoPE tail scoring: the NoPE K copy costs another ~7.6 GB at
 # 136K source, which cannot fit on 24 GB together with the 15.2 GB drafter
 # KV. Costs some far-position score quality (NIAH-validated below).
