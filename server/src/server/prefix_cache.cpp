@@ -1,6 +1,7 @@
 // Prefix cache implementation.
 
 #include "prefix_cache.h"
+#include "common/sha1.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -123,68 +124,6 @@ std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
 }
 
 // ─── Hashing ────────────────────────────────────────────────────────────
-
-// Simple SHA-1 using a minimal inline implementation (no OpenSSL dependency).
-// We only need a 16-byte hash for cache keys.
-
-// Minimal SHA-1 — just enough for cache keys. Using a simple portable impl.
-static void sha1_hash(const void * data, size_t len, uint8_t out[20]) {
-    // Rotate left
-    auto rotl = [](uint32_t x, int n) -> uint32_t {
-        return (x << n) | (x >> (32 - n));
-    };
-
-    uint32_t h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE,
-             h3 = 0x10325476, h4 = 0xC3D2E1F0;
-
-    // Pad message
-    size_t new_len = len + 1;
-    while (new_len % 64 != 56) new_len++;
-    std::vector<uint8_t> msg(new_len + 8, 0);
-    std::memcpy(msg.data(), data, len);
-    msg[len] = 0x80;
-    uint64_t bit_len = (uint64_t)len * 8;
-    for (int i = 0; i < 8; i++) {
-        msg[new_len + i] = (uint8_t)(bit_len >> (56 - 8 * i));
-    }
-
-    // Process blocks
-    for (size_t offset = 0; offset < msg.size(); offset += 64) {
-        uint32_t w[80];
-        for (int i = 0; i < 16; i++) {
-            w[i] = ((uint32_t)msg[offset + 4*i] << 24) |
-                    ((uint32_t)msg[offset + 4*i+1] << 16) |
-                    ((uint32_t)msg[offset + 4*i+2] << 8) |
-                    ((uint32_t)msg[offset + 4*i+3]);
-        }
-        for (int i = 16; i < 80; i++) {
-            w[i] = rotl(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
-        }
-
-        uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
-        for (int i = 0; i < 80; i++) {
-            uint32_t f, k;
-            if (i < 20)      { f = (b & c) | (~b & d); k = 0x5A827999; }
-            else if (i < 40) { f = b ^ c ^ d;          k = 0x6ED9EBA1; }
-            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
-            else              { f = b ^ c ^ d;          k = 0xCA62C1D6; }
-            uint32_t temp = rotl(a, 5) + f + e + k + w[i];
-            e = d; d = c; c = rotl(b, 30); b = a; a = temp;
-        }
-        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
-    }
-
-    // Output
-    auto store32 = [](uint8_t * p, uint32_t v) {
-        p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
-        p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
-    };
-    store32(out,     h0);
-    store32(out + 4, h1);
-    store32(out + 8, h2);
-    store32(out + 12, h3);
-    store32(out + 16, h4);
-}
 
 PrefixHash hash_prefix(const int32_t * ids, int count) {
     // Build hash input: [count as LE u32] + [ids as LE i32 array]
@@ -322,6 +261,21 @@ void PrefixCache::confirm_inline_snap(int slot, int target_cut,
         has_pending_evict_ = false;
     }
 
+    // The new snapshot replaces whatever this slot previously held. Drop any
+    // other entries still pointing at the slot: their hashes describe a
+    // different (or shorter) token stream than the new snapshot, and a later
+    // restore through them would attach mismatched KV. Stale entries arise
+    // when an aborted snap burns a round-robin next_slot_ step and a later
+    // confirm wraps onto a slot with a live entry (PR #370 repro).
+    for (int i = (int)entries_.size() - 1; i >= 0; --i) {
+        if (entries_[(size_t)i].slot == slot) {
+            std::fprintf(stderr,
+                "[pc] dropping stale entry for reused slot=%d\n", slot);
+            entries_.erase(entries_.begin() + i);
+            entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
     auto key = hash_prefix(prompt_ids.data(), target_cut);
     entries_.push_back({key, slot});
     entries_size_count_.fetch_add(1, std::memory_order_relaxed);
@@ -427,6 +381,15 @@ void PrefixCache::confirm_full_snap(int slot,
             full_entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
         }
         full_has_pending_evict_ = false;
+    }
+
+    for (int i = (int)full_entries_.size() - 1; i >= 0; --i) {
+        if (full_entries_[(size_t)i].entry.slot == slot) {
+            std::fprintf(stderr,
+                "[pc] dropping stale full-cache entry for reused slot=%d\n", slot);
+            full_entries_.erase(full_entries_.begin() + i);
+            full_entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+        }
     }
 
     auto key = hash_prefix(prompt_ids.data(), (int)prompt_ids.size());

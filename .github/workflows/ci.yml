@@ -10,8 +10,8 @@ jobs:
     name: uv workspace (lock + sync + import smoke)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
         with:
           version: "0.11.x"
       - name: Verify uv lockfile and workspace sync
@@ -19,11 +19,14 @@ jobs:
         # full sync and builds megakernel against torch.
         run: bash scripts/check_uv_workspace.sh
 
+      - name: Lint Python surfaces touched by lucebox tooling
+        run: uv run --frozen --extra dev ruff check .
+
   build:
     name: Build (cmake + uv sync --extra megakernel)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: recursive
           token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
@@ -39,7 +42,7 @@ jobs:
           sub-packages: '["nvcc", "cudart-dev", "thrust", "driver-dev"]'
           non-cuda-sub-packages: '["libcublas-dev"]'
 
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
         with:
           version: "0.11.x"
           # uv reads .python-version (3.12, matching the previous CI) and downloads the matching
@@ -112,15 +115,17 @@ jobs:
     # kernels for sm_86 but execute on GPU-less VMs, so the kernel never runs.
     # This job lands on lucebox3 (RTX 3090) and actually executes it.
     #
-    # SECURITY: a self-hosted runner must never execute untrusted fork code.
-    # This guard restricts the job to same-repo PRs (head repo == this repo)
-    # and manual dispatch, so fork PRs against this public repo skip it
-    # entirely and never run on the box. The ubuntu-latest jobs above still
-    # run for forks (safe, ephemeral GitHub VMs).
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.head.repo.full_name == github.repository
-    needs: [uv-workspace, build]
+    # SECURITY: fork PRs DO run here, but only after a maintainer approves the
+    # workflow run. The repo enforces approval_policy=all_external_contributors,
+    # so every push from an outside collaborator parks the run as
+    # action_required until a maintainer reviews the diff and approves it.
+    # That human checkpoint is the line of defense for the self-hosted box;
+    # do not weaken the approval policy while this job runs fork code.
+    # Gate only on the 1-minute workspace check, NOT the ~18-minute hosted
+    # CPU build: the GPU job compiles the same tree itself in ~2 minutes on
+    # real hardware, so serializing it behind the cloud build only delayed
+    # the strongest signal this CI produces.
+    needs: [uv-workspace]
     runs-on: [self-hosted, gpu, sm86]
     timeout-minutes: 30
     # The box has a single physical GPU: serialize GPU jobs across PRs instead
@@ -183,12 +188,13 @@ jobs:
     # faults on gfx1151); hipcc is not on the runner's minimal PATH, so it is
     # invoked by absolute path.
     #
-    # SECURITY: same fork guard as gpu-tests - never execute untrusted fork
-    # code on the self-hosted box. Fork PRs skip this job.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.head.repo.full_name == github.repository
-    needs: [uv-workspace, build]
+    # SECURITY: same model as gpu-tests - fork PRs run only after a maintainer
+    # approves the workflow run (approval_policy=all_external_contributors).
+    # Gate only on the 1-minute workspace check, NOT the ~18-minute hosted
+    # CPU build: the GPU job compiles the same tree itself in ~2 minutes on
+    # real hardware, so serializing it behind the cloud build only delayed
+    # the strongest signal this CI produces.
+    needs: [uv-workspace]
     runs-on: [self-hosted, rocm, gfx1151]
     timeout-minutes: 20
     # Same single box as gpu-tests: serialize GPU jobs across PRs.

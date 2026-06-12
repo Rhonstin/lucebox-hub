@@ -5,14 +5,20 @@
 
 #include "http_server.h"
 #include "sse_emitter.h"
+#include "prompt_normalize.h"
 #include "tool_hint.h"
+#include "common/sha1.h"
 
+#ifdef DFLASH_HAS_CURL
 #include <curl/curl.h>
+#endif
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -49,6 +55,7 @@ static float pflash_keep_ratio(const ServerConfig & cfg, int n_tokens) {
 }
 
 // ─── curl helpers for upstream proxy ─────────────────────────────────────
+#ifdef DFLASH_HAS_CURL
 
 struct CurlWriteCtx {
     int client_fd;
@@ -242,6 +249,7 @@ static bool curl_forward(int client_fd, const std::string & url,
     curl_easy_cleanup(curl);
     return res == CURLE_OK;
 }
+#endif // DFLASH_HAS_CURL
 
 // ─── /props constants ───────────────────────────────────────────────────
 //
@@ -574,6 +582,7 @@ json build_props_body(const ServerConfig & config,
             {"in_use",        pcfs.in_use},
             {"disk_bytes",    pcfs.disk_bytes},
             {"lifetime_hits", pcfs.lifetime_hits},
+            {"disk_policy",   disk_prefix_cache_policy_name(config.disk_cache_policy)},
         }},
         {"tool_replay", {
             {"max_entries",     tms.max_entries},
@@ -610,27 +619,10 @@ json build_props_body(const ServerConfig & config,
 // one helper guarantees token counting and generation can't drift.
 static void normalize_anthropic_system(const json & body, json & messages) {
     if (!body.contains("system")) return;
-    json sys_content = body["system"];
-    if (sys_content.is_array()) {
-        json filtered = json::array();
-        for (const auto & block : sys_content) {
-            if (block.is_object() && block.value("type", "") == "text") {
-                std::string text = block.value("text", "");
-                if (text.rfind("x-anthropic-billing-header:", 0) == 0) {
-                    continue;  // skip Claude Code billing header block
-                }
-            }
-            filtered.push_back(block);
-        }
-        sys_content = std::move(filtered);
-    } else if (sys_content.is_string()) {
-        std::string s = sys_content.get<std::string>();
-        if (s.rfind("x-anthropic-billing-header:", 0) == 0) {
-            sys_content = "";
-        }
-    }
-    if (!sys_content.empty()) {
-        json sys_msg = {{"role", "system"}, {"content", sys_content}};
+    // Delegate strip to the pure fn; insert as system message.
+    std::string text = dflash::common::normalize_system_for_cache(body["system"]);
+    if (!text.empty()) {
+        json sys_msg = {{"role", "system"}, {"content", text}};
         messages.insert(messages.begin(), sys_msg);
     }
 }
@@ -754,6 +746,48 @@ std::vector<ChatMessage> normalize_chat_messages(
     return chat_msgs;
 }
 
+// ─── Disk-cache identity salt ───────────────────────────────────────────
+// Compute a 16-byte salt from inputs that affect KV cache validity:
+//   model path + stat(size + mtime)  [covers rope/yarn — GGUF-derived],
+//   max_ctx, and sha1(chat_template_src).
+// Returns all-zeroes if model_path is empty (back-compat / disk disabled).
+static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg) {
+    std::array<uint8_t, 16> salt{};
+    if (cfg.model_path.empty()) return salt;
+
+    const std::string & path = cfg.model_path;
+    struct stat st{};
+    int64_t file_size  = 0;
+    int64_t file_mtime = 0;
+    if (::stat(path.c_str(), &st) == 0) {
+        file_size  = (int64_t)st.st_size;
+        file_mtime = (int64_t)st.st_mtime;
+    } else {
+        std::fprintf(stderr, "[disk-cache] salt: stat(%s) failed — path-only fingerprint\n",
+                     path.c_str());
+    }
+
+    // Hash chat_template_src separately (can be large; fold as digest).
+    uint8_t tmpl_digest[20] = {};
+    sha1_hash(cfg.chat_template_src.data(), cfg.chat_template_src.size(), tmpl_digest);
+
+    // Serialization: path_len(4) + path + file_size(8) + file_mtime(8) + max_ctx(4) + tmpl_digest(20).
+    std::vector<uint8_t> buf;
+    uint32_t plen = (uint32_t)path.size();
+    buf.insert(buf.end(), (uint8_t *)&plen,        (uint8_t *)&plen        + 4);
+    buf.insert(buf.end(), (uint8_t *)path.data(),  (uint8_t *)path.data()  + path.size());
+    buf.insert(buf.end(), (uint8_t *)&file_size,   (uint8_t *)&file_size   + 8);
+    buf.insert(buf.end(), (uint8_t *)&file_mtime,  (uint8_t *)&file_mtime  + 8);
+    int32_t mc = (int32_t)cfg.max_ctx;
+    buf.insert(buf.end(), (uint8_t *)&mc,          (uint8_t *)&mc          + 4);
+    buf.insert(buf.end(), tmpl_digest, tmpl_digest + 20);
+
+    uint8_t digest[20];
+    sha1_hash(buf.data(), buf.size(), digest);
+    std::memcpy(salt.data(), digest, 16);
+    return salt;
+}
+
 // ─── HttpServer ─────────────────────────────────────────────────────────
 
 HttpServer::HttpServer(ModelBackend & backend,
@@ -770,7 +804,16 @@ HttpServer::HttpServer(ModelBackend & backend,
                    config.disk_cache_continued_interval,
                    config.disk_cache_cold_max_tokens}, backend)
 {
+    #ifdef DFLASH_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    #endif
+    // Fold model+config identity into the layout fingerprint BEFORE init()
+    // so compute_layout_id sees it on every learn/verify call. Prevents stale
+    // KV hits when the server restarts over the same --kv-cache-dir with a
+    // different model, max_ctx, or chat_template (gemma4 ↔ qwen3.6, etc.).
+    if (!disk_cache_.disabled()) {
+        disk_cache_.set_identity_salt(compute_disk_cache_salt(config));
+    }
     disk_cache_.init();
     status_html_path_ = resolve_status_html();
 }
@@ -906,7 +949,9 @@ void HttpServer::sse_heartbeat() {
 
 HttpServer::~HttpServer() {
     shutdown();
+    #ifdef DFLASH_HAS_CURL
     curl_global_cleanup();
+    #endif
 }
 
 void HttpServer::shutdown() {
@@ -1267,6 +1312,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         // Common fields.
         req.stream = body.value("stream", false);
         req.model = body.value("model", config_.model_name);
+        req.disk_cache_policy = config_.disk_cache_policy;
         // Default when client omits all three: use --default-max-tokens
         // (16000, matches ds4_eval.c). Codex review flagged that
         // --default-max-tokens was previously a dead flag because the
@@ -1323,6 +1369,28 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             req.tool_choice = body["tool_choice"];
         }
 
+        if (body.contains("prefix_cache") && body["prefix_cache"].is_object()) {
+            const auto & pc = body["prefix_cache"];
+            if (pc.contains("scope") && pc["scope"].is_string()) {
+                DiskPrefixCachePolicy parsed_policy;
+                if (!parse_disk_prefix_cache_policy(pc["scope"].get<std::string>(),
+                                                    parsed_policy)) {
+                    send_error(fd, 400,
+                        "prefix_cache.scope must be off, full, auto, auto:<window>, or a positive token count");
+                    return true;
+                }
+                req.disk_cache_policy = parsed_policy;
+            }
+            if (pc.contains("window") && pc["window"].is_number_integer()) {
+                const int window = pc["window"].get<int>();
+                if (window <= 0 || window > 1000000) {
+                    send_error(fd, 400, "prefix_cache.window must be a positive integer");
+                    return true;
+                }
+                req.disk_cache_policy.auto_window = window;
+            }
+        }
+
         // Stop sequences — OpenAI uses "stop" (string or array), Anthropic uses "stop_sequences" (array).
         if (body.contains("stop")) {
             auto & stop = body["stop"];
@@ -1355,6 +1423,14 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             req.format = ApiFormat::OPENAI_CHAT;
             req.response_id = generate_id("chatcmpl");
             req.messages = body["messages"];
+            // Strip volatile billing header from messages[0] (OpenAI system).
+            if (req.messages.is_array() && !req.messages.empty()) {
+                auto & m0 = req.messages[0];
+                if (m0.is_object() && m0.value("role", "") == "system" &&
+                    m0.contains("content") && m0["content"].is_string()) {
+                    m0["content"] = dflash::common::normalize_system_for_cache(req.messages);
+                }
+            }
         } else if (hr.path == "/v1/messages/count_tokens") {
             req.format = ApiFormat::ANTHROPIC;
             req.response_id = generate_id("count");
@@ -1374,7 +1450,9 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                 req.messages = body["input"];
             }
             if (body.contains("instructions")) {
-                json sys_msg = {{"role", "system"}, {"content", body["instructions"]}};
+                // Strip billing header from codex instructions before hashing.
+                std::string inst = dflash::common::normalize_system_for_cache(body["instructions"]);
+                json sys_msg = {{"role", "system"}, {"content", inst}};
                 if (req.messages.is_array()) {
                     req.messages.insert(req.messages.begin(), sys_msg);
                 } else {
@@ -1902,6 +1980,7 @@ void HttpServer::worker_loop() {
         }
 
         // ── Upstream proxy: forward to remote server if configured ────
+#ifdef DFLASH_HAS_CURL
         if (!config_.pflash_upstream_base.empty()) {
             const std::string & upstream = config_.pflash_upstream_base;
             const std::string & upstream_key = config_.pflash_upstream_key;
@@ -1950,6 +2029,7 @@ void HttpServer::worker_loop() {
             finish_job();
             continue;
         }
+#endif // DFLASH_HAS_CURL
 
         // Build generate request.
         //
@@ -2076,14 +2156,145 @@ void HttpServer::worker_loop() {
         // so slot 63 is safe as long as total cache slots < 63.
         static constexpr int DISK_STAGING_SLOT = ModelBackend::kMaxSlots - 1;
         bool disk_hit = false;
+        DiskPrefixCachePolicy disk_policy = req.disk_cache_policy;
+        if (pflash_compressed) {
+            // Auto/fixed boundaries are selected against the uncompressed
+            // request stream. Once PFlash rewrites effective_prompt, only
+            // exact full-cache restore remains well-defined.
+            if (disk_policy.mode != DiskPrefixCacheMode::Full) {
+                disk_policy.mode = DiskPrefixCacheMode::Off;
+            }
+        }
+        std::vector<int> safe_boundaries;
+        if (disk_policy.mode == DiskPrefixCacheMode::Auto) {
+            safe_boundaries =
+                find_all_boundaries(effective_prompt, prefix_cache_.chat_markers());
+        }
+        int selected_prefix_boundary = 0;
+        if (disk_policy.mode == DiskPrefixCacheMode::Fixed) {
+            selected_prefix_boundary =
+                disk_prefix_cache_fixed_boundary(
+                    disk_policy, (int)effective_prompt.size(),
+                    config_.disk_cache_min_tokens);
+        } else if (disk_policy.mode == DiskPrefixCacheMode::Auto) {
+            selected_prefix_boundary =
+                disk_prefix_cache_auto_boundary(
+                    effective_prompt, recent_disk_prompts_, disk_policy.auto_window,
+                    safe_boundaries, config_.disk_cache_min_tokens);
+            std::fprintf(stderr,
+                "[disk-cache] auto scope: window=%d recent=%zu safe=%zu selected=%d\n",
+                disk_policy.auto_window,
+                std::min(recent_disk_prompts_.size(), (size_t)disk_policy.auto_window),
+                safe_boundaries.size(), selected_prefix_boundary);
+        }
+        std::vector<int> disk_lookup_lengths;
+        if (disk_policy.mode == DiskPrefixCacheMode::Full &&
+            !effective_prompt.empty()) {
+            disk_lookup_lengths.push_back((int)effective_prompt.size());
+            if ((int)effective_prompt.size() > config_.disk_cache_cold_max_tokens) {
+                auto boundaries =
+                    find_all_boundaries(effective_prompt, prefix_cache_.chat_markers());
+                int cold_boundary = 0;
+                for (int b : boundaries) {
+                    if (b <= config_.disk_cache_cold_max_tokens &&
+                        b >= config_.disk_cache_min_tokens) {
+                        cold_boundary = b;
+                    }
+                }
+                if (cold_boundary > 0 &&
+                    cold_boundary != (int)effective_prompt.size()) {
+                    disk_lookup_lengths.push_back(cold_boundary);
+                }
+            }
+        } else if (selected_prefix_boundary > 0) {
+            disk_lookup_lengths.push_back(selected_prefix_boundary);
+        } else if (disk_policy.mode == DiskPrefixCacheMode::Auto) {
+            for (auto it = safe_boundaries.rbegin(); it != safe_boundaries.rend(); ++it) {
+                const int b = *it;
+                if (b >= config_.disk_cache_min_tokens &&
+                    b <= (int)effective_prompt.size()) {
+                    disk_lookup_lengths.push_back(b);
+                }
+            }
+        }
         if (!using_restore && !disk_cache_.disabled()) {
-            if (disk_cache_.lookup(effective_prompt, DISK_STAGING_SLOT)) {
-                cache_slot = DISK_STAGING_SLOT;
-                prefix_len = backend_.snapshot_cur_pos(DISK_STAGING_SLOT);
-                using_restore = true;
-                disk_hit = true;
-                std::fprintf(stderr, "[disk-cache] hit, loaded to slot=%d pos=%d\n",
-                             DISK_STAGING_SLOT, prefix_len);
+            for (int lookup_len : disk_lookup_lengths) {
+                std::vector<int32_t> prefix_tokens(
+                    effective_prompt.begin(), effective_prompt.begin() + lookup_len);
+                if (disk_cache_.lookup(prefix_tokens, DISK_STAGING_SLOT)) {
+                    cache_slot = DISK_STAGING_SLOT;
+                    prefix_len = backend_.snapshot_cur_pos(DISK_STAGING_SLOT);
+                    if (prefix_len <= 0 || prefix_len > (int)effective_prompt.size()) {
+                        std::fprintf(stderr,
+                            "[disk-cache] ignoring invalid hit pos=%d prompt=%zu\n",
+                            prefix_len, effective_prompt.size());
+                        backend_.snapshot_free(DISK_STAGING_SLOT);
+                        continue;
+                    }
+                    using_restore = true;
+                    disk_hit = true;
+                    std::fprintf(stderr,
+                        "[disk-cache] hit policy=%s len=%d slot=%d pos=%d\n",
+                        disk_prefix_cache_policy_name(disk_policy).c_str(), lookup_len,
+                        DISK_STAGING_SLOT, prefix_len);
+                    break;
+                }
+            }
+        }
+
+        // Scoped prefix save: auto/fixed modes prefill exactly to the
+        // selected token boundary and save that snapshot.
+        // This keeps the disk key and snapshot position aligned; unlike the
+        // legacy full-prompt key path, scoped entries must not point at a
+        // longer snapshot than their token hash covers.
+        if (!using_restore && !disk_cache_.disabled() &&
+            selected_prefix_boundary > 0) {
+            const int scoped_boundary = selected_prefix_boundary;
+            if (scoped_boundary > 0) {
+                std::fprintf(stderr,
+                    "[disk-cache] scoped prefix: policy=%s boundary=%d\n",
+                    disk_prefix_cache_policy_name(disk_policy).c_str(), scoped_boundary);
+                GenerateRequest scoped_req;
+                scoped_req.prompt = std::vector<int32_t>(
+                    effective_prompt.begin(), effective_prompt.begin() + scoped_boundary);
+                scoped_req.n_gen = 0;
+                scoped_req.snap_slot = DISK_STAGING_SLOT;
+                scoped_req.snap_pos = scoped_boundary;
+                DaemonIO scoped_io;
+                scoped_io.stream_fd = -1;
+                auto scoped_result = backend_.generate(scoped_req, scoped_io);
+                if (scoped_result.ok && backend_.snapshot_used(DISK_STAGING_SLOT)) {
+                    disk_cache_.learn_layout(DISK_STAGING_SLOT);
+                    const bool saved =
+                        disk_cache_.save(DISK_STAGING_SLOT, scoped_req.prompt);
+                    cache_slot = DISK_STAGING_SLOT;
+                    prefix_len = scoped_boundary;
+                    using_restore = true;
+                    disk_hit = true;
+                    std::fprintf(stderr,
+                        "[disk-cache] scoped prefix %s, restoring from %d\n",
+                        saved ? "saved" : "staged", scoped_boundary);
+                } else {
+                    backend_.snapshot_free(DISK_STAGING_SLOT);
+                }
+            }
+        }
+
+        // A slot whose snapshot covers more KV than this prompt cannot be
+        // diff-prefilled (the client edited/summarized its history since the
+        // snapshot was saved). Treat as a cache miss; the backend-side
+        // fallback also guards this, but skipping restore here avoids a
+        // pointless snapshot copy-in.
+        if (using_restore) {
+            const int snap_len = backend_.snapshot_cur_pos(cache_slot);
+            if (snap_len > (int)effective_prompt.size()) {
+                std::fprintf(stderr,
+                    "[pc] slot=%d snapshot pos=%d > prompt=%zu — treating as miss\n",
+                    cache_slot, snap_len, effective_prompt.size());
+                cache_slot = -1;
+                prefix_len = 0;
+                using_restore = false;
+                disk_hit = false;
             }
         }
 
@@ -2109,7 +2320,8 @@ void HttpServer::worker_loop() {
         // turn boundary and save a cold checkpoint before the full generation.
         // This makes subsequent requests to similar (but not identical) prompts
         // much faster by reusing the cold prefix.
-        if (!using_restore && !disk_cache_.disabled()) {
+        if (!using_restore && !disk_cache_.disabled() &&
+            disk_policy.mode == DiskPrefixCacheMode::Full) {
             auto boundaries = find_all_boundaries(effective_prompt, prefix_cache_.chat_markers());
             int cold_boundary = disk_cache_.cold_prefix_boundary(effective_prompt, boundaries);
             if (cold_boundary > 0) {
@@ -2153,13 +2365,15 @@ void HttpServer::worker_loop() {
 
         std::fprintf(stderr,
             "[server] chat CACHE %s restore=%s slot=%d prefix_len=%d "
-            "effective_prompt=%zu pflash=%s disk_hit=%s snap_slot=%d snap_pos=%d\n",
+            "effective_prompt=%zu pflash=%s disk_policy=%s disk_hit=%s "
+            "snap_slot=%d snap_pos=%d\n",
             req.response_id.c_str(),
             using_restore ? "true" : "false",
             cache_slot,
             prefix_len,
             effective_prompt.size(),
             pflash_compressed ? "true" : "false",
+            disk_prefix_cache_policy_name(disk_policy).c_str(),
             disk_hit ? "true" : "false",
             snap_slot,
             snap_cut);
@@ -2338,7 +2552,9 @@ void HttpServer::worker_loop() {
                 // Save to disk cache if threshold met.
                 if (!disk_cache_.disabled()) {
                     disk_cache_.learn_layout(snap_slot);
-                    disk_cache_.save(snap_slot, effective_prompt);
+                    if (disk_policy.mode == DiskPrefixCacheMode::Full) {
+                        disk_cache_.save(snap_slot, effective_prompt);
+                    }
                 }
             } else {
                 prefix_cache_.abort_inline_snap(snap_slot);
@@ -2352,7 +2568,8 @@ void HttpServer::worker_loop() {
 
         // Continued checkpoint: save if total tokens crossed an interval boundary.
         // This captures prompt + all generated tokens for long conversation reuse.
-        if (!disk_cache_.disabled() && result.ok && completion_tokens > 0 &&
+        if (!disk_cache_.disabled() && disk_policy.mode == DiskPrefixCacheMode::Full &&
+            result.ok && completion_tokens > 0 &&
             visible_output_seen && !client_disconnected) {
             int final_pos = (int)effective_prompt.size() + (int)result.tokens.size();
             if (final_pos >= disk_cache_.continued_interval()) {
@@ -2365,6 +2582,14 @@ void HttpServer::worker_loop() {
                     disk_cache_.maybe_store_continued(DISK_STAGING_SLOT, all_tokens, final_pos);
                     backend_.snapshot_free(DISK_STAGING_SLOT);
                 }
+            }
+        }
+
+        if (!disk_cache_.disabled() && !pflash_compressed) {
+            recent_disk_prompts_.insert(recent_disk_prompts_.begin(), effective_prompt);
+            static constexpr size_t kMaxRecentDiskPrompts = 256;
+            if (recent_disk_prompts_.size() > kMaxRecentDiskPrompts) {
+                recent_disk_prompts_.resize(kMaxRecentDiskPrompts);
             }
         }
 

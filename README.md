@@ -151,6 +151,61 @@ python3 harness/client_test_runner.py bench \
   --n-sample 3
 ```
 
+## Quick Start With Docker
+
+Prebuilt images on GHCR track `main`. No CUDA toolkit or build needed. Pull the image, mount weights and serve. OpenAI-compatible API on `:8000`.
+
+<table>
+<tr>
+<td width="38%" valign="middle">
+
+| GPU | Image tag |
+|-----|-----------|
+| NVIDIA (CUDA 12+) | `:cuda12` |
+| AMD (ROCm 6+) | `:rocm` |
+
+Drop a GGUF model target into `server/models/` first, then
+`:8000/v1/chat/completions`. Full tutorial in the
+[Docker blog](https://lucebox.com/blog/docker).
+
+</td>
+<td width="62%" valign="middle">
+
+<a href="https://lucebox.com/blog/docker"><img src="assets/docker.png" alt="Lucebox prebuilt Docker images for NVIDIA and AMD" width="100%" /></a>
+
+</td>
+</tr>
+</table>
+
+**Install and run:**
+
+```bash
+# 1. Pull the image for your GPU
+docker pull ghcr.io/luce-org/lucebox-hub:cuda12   # NVIDIA
+docker pull ghcr.io/luce-org/lucebox-hub:rocm     # AMD
+
+# 2. Download a target model into server/models/ and the DFlash draft
+#    into server/models/draft/ (the entrypoint only auto-discovers the
+#    draft there; without it the server runs slower, target-only)
+hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf \
+  --local-dir server/models/
+hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf \
+  --local-dir server/models/draft/
+
+# 3a. NVIDIA (CUDA 12+)
+docker run --rm --gpus all -p 8000:8080 \
+  -v "$PWD/server/models:/opt/lucebox-hub/server/models" \
+  ghcr.io/luce-org/lucebox-hub:cuda12
+
+# 3b. AMD (ROCm 6+, Strix Halo / RX 7900)
+docker run --rm --device /dev/kfd --device /dev/dri \
+  --group-add video --group-add render --security-opt seccomp=unconfined \
+  -p 8000:8080 -v "$PWD/server/models:/opt/lucebox-hub/server/models" \
+  ghcr.io/luce-org/lucebox-hub:rocm
+```
+
+Then hit `:8000/v1/chat/completions` (OpenAI-compatible).
+
 ## Run the Server
 
 Default: Qwen 3.6-27B Q4_K_M target + Lucebox Q4_K_M DFlash drafter on RTX 3090. DDTree budget=22, TQ3_0 KV cache, sliding FA window 2048. OpenAI-compatible HTTP on `:8000`.

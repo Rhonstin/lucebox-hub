@@ -260,6 +260,7 @@ add_library(dflash_common STATIC
     src/common/moe_hybrid_storage.cpp
     src/common/spark_corpus.cpp
     src/common/moe_hybrid_ffn_eval.cpp
+    src/common/moe_hybrid_stream.cpp
     src/common/cold_ffn_cpu.cpp
     src/common/moe_hybrid_swap_manager.cpp
     src/qwen35/layer_split_forward.cpp
@@ -583,11 +584,37 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_adaptive_keep_ratio PRIVATE dflash_common)
         add_test(NAME adaptive_keep COMMAND test_adaptive_keep_ratio)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_derived_scalars.cpp")
+        add_executable(test_derived_scalars test/test_derived_scalars.cpp)
+        target_include_directories(test_derived_scalars PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        add_test(NAME derived_scalars COMMAND test_derived_scalars)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_bandit_integration.cpp")
         add_executable(test_bandit_integration test/test_bandit_integration.cpp)
         target_include_directories(test_bandit_integration PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(test_bandit_integration PRIVATE dflash_common)
         add_test(NAME bandit_integration COMMAND test_bandit_integration)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_anchor_params.cpp")
+        add_executable(test_anchor_params test/test_anchor_params.cpp)
+        target_include_directories(test_anchor_params PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_anchor_params PRIVATE dflash_common)
+        add_test(NAME anchor_params COMMAND test_anchor_params)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_tail_capture_guard.cpp")
+        # GREEN phase: built with TAIL_GUARD_USE_NEW_FORMULA — must pass after Bug #42 fix.
+        add_executable(test_drafter_tail_capture_guard
+            test/test_drafter_tail_capture_guard.cpp)
+        target_compile_definitions(test_drafter_tail_capture_guard PRIVATE
+            TAIL_GUARD_USE_NEW_FORMULA)
+        add_test(NAME test_drafter_tail_capture_guard
+            COMMAND test_drafter_tail_capture_guard)
+        # RED phase binary: same source WITHOUT the fix flag — documents the bug.
+        add_executable(test_drafter_tail_capture_guard_red
+            test/test_drafter_tail_capture_guard.cpp)
+        # No TAIL_GUARD_USE_NEW_FORMULA — uses old (buggy) guard, expected to FAIL.
+        add_test(NAME test_drafter_tail_capture_guard_red COMMAND test_drafter_tail_capture_guard_red)
+        set_tests_properties(test_drafter_tail_capture_guard_red PROPERTIES WILL_FAIL TRUE)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
         add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)
@@ -672,6 +699,16 @@ if(DFLASH27B_TESTS)
         target_include_directories(bench_laguna_generate PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(bench_laguna_generate PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_spark.cpp")
+        add_executable(bench_laguna_spark test/bench_laguna_spark.cpp)
+        target_include_directories(bench_laguna_spark PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(bench_laguna_spark PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_moe_stream.cpp" AND DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+        add_executable(bench_moe_stream test/bench_moe_stream.cpp)
+        target_include_directories(bench_moe_stream PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(bench_moe_stream PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} CUDA::cudart)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_laguna_daemon.cpp")
         add_executable(test_laguna_daemon test/test_laguna_daemon.cpp)
         target_include_directories(test_laguna_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -721,34 +758,35 @@ if(DFLASH27B_TESTS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/server/server_main.cpp")
         find_package(CURL QUIET)
         if(NOT CURL_FOUND)
-            message(WARNING "CURL not found — skipping dflash_server (passthrough proxy disabled)")
+            message(WARNING "CURL not found — building dflash_server without passthrough proxy")
+        endif()
+        add_executable(dflash_server
+            src/server/server_main.cpp
+            src/server/http_server.cpp
+            src/server/model_card.cpp
+            src/server/prompt_normalize.cpp
+        )
+        target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(dflash_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
         else()
-            add_executable(dflash_server
-                src/server/server_main.cpp
-                src/server/http_server.cpp
-                src/server/model_card.cpp
-            )
-            target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-            if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-                target_compile_definitions(dflash_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
-            else()
-                target_compile_definitions(dflash_server PRIVATE
-                    DFLASH27B_BACKEND_CUDA=1
-                    DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
-            endif()
-            target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread CURL::libcurl)
-            if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-                find_package(CUDAToolkit REQUIRED)
-                target_link_libraries(dflash_server PRIVATE CUDA::cudart)
-            else()
-                target_link_libraries(dflash_server PRIVATE hip::host)
-            endif()
+            target_compile_definitions(dflash_server PRIVATE
+                DFLASH27B_BACKEND_CUDA=1
+                DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
+        endif()
+        target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
+        if(CURL_FOUND)
+            target_compile_definitions(dflash_server PRIVATE DFLASH_HAS_CURL=1)
+            target_link_libraries(dflash_server PRIVATE CURL::libcurl)
+        endif()
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(dflash_server PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(dflash_server PRIVATE hip::host)
         endif()
 
         # Copy share/status.html next to the binary so it can be found at runtime.
-        # Guard on the target: dflash_server is skipped when CURL is absent
-        # (e.g. CI without libcurl-dev), and referencing a missing target in
-        # add_custom_command/install is a hard CMake configure error.
         if(TARGET dflash_server)
             add_custom_command(TARGET dflash_server POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory
@@ -808,11 +846,12 @@ if(DFLASH27B_TESTS)
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
     enable_testing()
 
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp" AND CURL_FOUND)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         add_executable(test_server_unit test/test_server_unit.cpp)
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
-            src/server/model_card.cpp)
+            src/server/model_card.cpp
+            src/server/prompt_normalize.cpp)
         target_include_directories(test_server_unit PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_server_unit PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
@@ -821,7 +860,13 @@ if(DFLASH27B_TESTS)
                 DFLASH27B_BACKEND_CUDA=1
                 DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
         endif()
-        target_link_libraries(test_server_unit PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} CURL::libcurl)
+        if(CURL_FOUND)
+            target_compile_definitions(test_server_unit PRIVATE DFLASH_HAS_CURL=1)
+        endif()
+        if(CURL_FOUND)
+            target_link_libraries(test_server_unit PRIVATE CURL::libcurl)
+        endif()
+        target_link_libraries(test_server_unit PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             find_package(CUDAToolkit REQUIRED)
             target_link_libraries(test_server_unit PRIVATE CUDA::cudart)

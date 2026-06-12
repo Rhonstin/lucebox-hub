@@ -14,7 +14,27 @@ dependencies = [
 
 [project.optional-dependencies]
 megakernel = ["qwen35-megakernel-bf16"]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "mypy>=1.10,<2", "ruff>=0.14,<1"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# Staged lint adoption: the host-CLI / harness tooling is gated now. The
+# server-internal and optimization Python (server/scripts, optimizations/*)
+# carries pre-existing style debt and is added to `include` as it is cleaned
+# up. Vendored deps stay excluded permanently (extend-exclude below).
+include = ["harness/**/*.py", "scripts/**/*.py"]
+extend-exclude = [
+    "dflash/deps",
+    "megakernel",
+    "pflash",
+]
+
+[tool.ruff.lint]
+# Correctness + imports + modernization + bugbear. Line-length / style (E5xx,
+# E7xx) is intentionally staged out for now so the gate stays green without
+# reflowing existing code; tighten once the tracked surfaces are clean.
+select = ["F", "I", "UP", "B"]
 
 [tool.uv]
 package = false
@@ -31,6 +51,8 @@ package = false
 no-build-isolation-package = ["qwen35-megakernel-bf16"]
 
 [tool.uv.workspace]
+# Workspace members. Keeping the list to the packages that live in this
+# repo lets `uv lock --check` / `uv sync --frozen` pass.
 members = ["server", "optimizations/megakernel", "optimizations/pflash"]
 
 [tool.uv.sources]

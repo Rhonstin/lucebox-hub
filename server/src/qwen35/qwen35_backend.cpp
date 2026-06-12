@@ -355,6 +355,11 @@ bool Qwen35Backend::snapshot_used(int slot) const {
     return prefix_snapshots_[slot].ctx != nullptr;
 }
 
+bool Qwen35Backend::restore_target_cache_from_snapshot(int slot) {
+    if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) return false;
+    return restore_target_cache(prefix_snapshots_[slot], cache_);
+}
+
 int Qwen35Backend::snapshot_cur_pos(int slot) const {
     if (slot < 0 || slot >= PREFIX_SLOTS) return 0;
     return prefix_snapshots_[slot].cur_pos;
@@ -753,6 +758,11 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         return result;
     }
 
+    // Clear-then-restore: the step-invariant decode reads a 256-padded,
+    // mask-less FA span, so rows beyond the restored prefix must be ZERO,
+    // not leftovers from the previous request. cudaMemset is ~0.2ms.
+    if (cache_.base_buf) ggml_backend_buffer_clear(cache_.base_buf, 0);
+
     // Restore snapshot
     restore_target_cache(prefix_snapshots_[slot], cache_);
 
@@ -800,8 +810,9 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         result.prefill_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_prefill_start).count();
     } else if (prompt_len > 0 && prompt_len < snap_pos) {
-        // The slot's snapshot covers more KV than the new prompt (the client
-        // edited or summarized its history). Fall back to a fresh full
+        // The slot's snapshot covers more KV than the new prompt. This is
+        // routine with agent clients (Letta, Hermes, ...) that edit or
+        // summarize their history between turns. Fall back to a fresh full
         // prefill instead of failing the request with zero tokens.
         std::fprintf(stderr,
             "[pc] snapshot longer than prompt (snap=%d > prompt=%d) — "
@@ -1003,6 +1014,19 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
 
         start += n_tokens;
+    }
+
+    // End-of-prefill snapshot: scoped disk-cache saves (auto/fixed policy)
+    // request snap_pos == prompt end, which never falls inside a chunk so the
+    // boundary branch above cannot fire. Taking the snapshot here changes
+    // nothing about the prefill computation; it only persists the final state
+    // (cache_.cur_pos == committed).
+    if (snap_slot >= 0 && snap_pos == committed) {
+        if (snapshot_save(snap_slot)) {
+            std::printf("[snap] end-of-prefill slot=%d cur_pos=%d\n",
+                        snap_slot, committed);
+            std::fflush(stdout);
+        }
     }
 
     return committed;
