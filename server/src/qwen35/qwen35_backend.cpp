@@ -1503,10 +1503,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // sampler chain instead of its argmax, so every committed token is an
     // exact target sample — the output distribution is identical to AR
     // sampling. Acceptance drops vs greedy but stays far above the AR
-    // floor. Opt out with DFLASH_SAMPLED_VERIFY=0.
+    // floor. Opt in with DFLASH_SAMPLED_VERIFY=1; without it, sampling
+    // requests fall back to AR decode (zero behavior change by default).
     static const bool kSampledVerify = []() {
         const char * e = std::getenv("DFLASH_SAMPLED_VERIFY");
-        return e == nullptr || std::string(e) != "0";
+        return e != nullptr && std::string(e) == "1";
     }();
     // Sampled-verify additionally requires full attention in the verify
     // path. With a finite --fa-window the verify batch applies one
@@ -1879,7 +1880,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     return false;
                 }
                 const int vocab_v = (int)(verify_logits.size() / (size_t)n_tree_tok);
+                // Penalty history must match AR exactly: when AR samples the
+                // token after X, X is already in out_tokens. The root/seed
+                // token is committed by this step's replay but not yet in
+                // out_tokens, so add it before walking.
                 verify_history = out_tokens;
+                verify_history.push_back(draft_tok[0]);
                 int cur = 0;
                 while (true) {
                     const int s = sample_logits(
@@ -1936,7 +1942,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     }
                 }
             }
+            // Penalty history must match AR exactly: when AR samples the
+            // token after X, X is already in out_tokens. The seed
+            // draft_tok[0] is committed by this step's replay but not yet
+            // in out_tokens, so add it before the walk — without it the
+            // repetition penalty never sees the seed and the sampled
+            // distribution drifts from AR whenever penalties are active.
             verify_history = out_tokens;
+            verify_history.push_back(draft_tok[0]);
             bool mismatched = false;
             for (int i = 0; i < q_len - 1; i++) {
                 const int s = sample_logits(
