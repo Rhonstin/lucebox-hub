@@ -3,6 +3,8 @@
 #include "ggml-alloc.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace dflash::common {
 
@@ -425,6 +427,40 @@ bool build_lm_head_projection_step(
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+}
+
+}  // namespace dflash::common
+
+namespace dflash::common {
+
+void dnet_ab_report(const StepGraph & sg, const char * tag) {
+    static const int mode = []() {
+        const char * e = std::getenv("DFLASH27B_CHUNKED");
+        return e ? std::atoi(e) : 0;
+    }();
+    if (mode != 2 || !sg.gf) return;
+
+    float max_o = 0.0f, max_s = 0.0f;
+    const char * max_o_name = "";
+    const char * max_s_name = "";
+    int n = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(sg.gf); i++) {
+        ggml_tensor * t = ggml_graph_node(sg.gf, i);
+        if (std::strncmp(t->name, "dnet_ab_", 8) != 0) continue;
+        float v = 0.0f;
+        ggml_backend_tensor_get(t, &v, 0, sizeof v);
+        n++;
+        if (t->name[8] == 'o') {
+            if (v > max_o) { max_o = v; max_o_name = t->name; }
+        } else {
+            if (v > max_s) { max_s = v; max_s_name = t->name; }
+        }
+    }
+    if (n > 0) {
+        std::fprintf(stderr,
+            "[dnet-ab] %s nodes=%d max_out_l1=%.4f (%s) max_state_l1=%.4f (%s)\n",
+            tag, n, max_o, max_o_name, max_s, max_s_name);
+    }
 }
 
 }  // namespace dflash::common

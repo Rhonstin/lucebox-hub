@@ -14,6 +14,11 @@
 // tree path (parent_ids != null) and the rollback-capture path still
 // use the sequential kernel. Those cases need per-token state fanout
 // which chunking does not preserve.
+//
+// Correctness: verified bit-close against the fused sequential kernel by
+// test_delta_net_chunked_parity (contiguous and strided-view inputs,
+// padded and exact-chunk sizes, chained persistent-state steps, mild and
+// strongly negative gates, CPU and CUDA).
 
 #include "delta_net_chunked.h"
 
@@ -57,6 +62,24 @@ DeltaNetChunkedResult build_delta_net_chunked(
     GGML_ASSERT(                   g->ne[1] == H_v && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
+
+    // The call site passes strided views (q_c/k_c/v_c are views into the
+    // conv output; v_c in particular never goes through l2_norm and keeps
+    // its raw stride). The scale/permute/pad preamble below silently reads
+    // wrong memory on CUDA for such views (and asserts on CPU), which was
+    // the long-standing "slightly wrong state, loopy output" bug that kept
+    // this path disabled. Force contiguity first; the copies are noise
+    // next to the chunk matmuls.
+    if (!ggml_is_contiguous(q)) q = ggml_cont(ctx0, q);
+    if (!ggml_is_contiguous(k)) k = ggml_cont(ctx0, k);
+    if (!ggml_is_contiguous(v)) v = ggml_cont(ctx0, v);
+    if (!ggml_is_contiguous(g)) g = ggml_cont(ctx0, g);
+    if (!ggml_is_contiguous(b)) b = ggml_cont(ctx0, b);
+    // Snapshot the recurrent state: `s` is typically a live view over the
+    // persistent ssm_state cache buffer that the caller overwrites at the
+    // end of the same graph. Reading through a private copy removes any
+    // dependence on node ordering vs that write.
+    s = ggml_cont(ctx0, s);
 
     const float scale = 1.0f / sqrtf((float)S_k);
 

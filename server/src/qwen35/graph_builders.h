@@ -100,4 +100,9 @@ bool build_lm_head_projection_step(
     ggml_backend_t backend,
     int n_tokens);
 
+// DFLASH27B_CHUNKED=2 A/B debug: scan the computed graph for the per-layer
+// dnet_ab_{o,s}_<n> L1-diff scalars emitted by build_delta_net_block and
+// print a summary line. No-op unless the env mode is 2.
+void dnet_ab_report(const StepGraph & sg, const char * tag);
+
 }  // namespace dflash::common
