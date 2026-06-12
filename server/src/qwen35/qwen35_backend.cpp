@@ -991,6 +991,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             return -1;
         }
         after_target_compute(sg_, kv_pos, n_tokens);
+        dnet_ab_report(sg_, "prefill");
 
         int32_t last_tok = -1;
         const bool is_final_chunk = (start + n_tokens >= prompt_len);

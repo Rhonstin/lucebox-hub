@@ -813,24 +813,44 @@ static ggml_tensor * build_delta_net_block(
     // capture (no cap). Ported from llama.cpp
     // src/models/delta-net-base.cpp::build_delta_net_chunking. At n_tokens=16
     // and 48 delta-net layers it eliminates the serial per-token loop that
-    // dominates target-verify compute at long ctx. Currently OFF by
-    // default — port produces correct shape but slightly wrong final state,
-    // causing AL degradation and loopy output. Set DFLASH27B_CHUNKED=1 to
-    // opt in for A/B testing while debugging.
-    bool use_chunked = false;
-    if (!parent_ids && !cap && n_seq_tokens > 1) {
-        if (const char * s_env = std::getenv("DFLASH27B_CHUNKED")) {
-            use_chunked = (std::atoi(s_env) != 0);
-        }
-    }
+    // dominates target-verify compute at long ctx. The historical "slightly
+    // wrong final state / loopy output" was a strided-view aliasing bug:
+    // v_c is a raw view into conv_out and the chunked preamble read it as
+    // contiguous (q_c/k_c were saved by their l2_norm cont). Fixed by
+    // contiguity guards inside build_delta_net_chunked; parity proven by
+    // test_delta_net_chunked_parity. Opt in with DFLASH27B_CHUNKED=1.
+    // DFLASH27B_CHUNKED: 1 = use the chunked path; 2 = A/B debug — compute
+    // BOTH paths, serve the sequential result, and emit per-layer L1-diff
+    // scalars named dnet_ab_{o,s}_<n> (read back by dnet_ab_report after
+    // graph compute).
+    static const int chunked_mode = []() {
+        const char * s_env = std::getenv("DFLASH27B_CHUNKED");
+        return s_env ? std::atoi(s_env) : 0;
+    }();
+    // Engage only at prefill-sized batches. Measured on the 3090: at
+    // n_seq_tokens <= 23 (spec verify/replay) the pad-to-64 matmuls plus
+    // the cont copies are slower than the fused sequential kernel
+    // (short-prompt decode 34 -> 29 tok/s); at n = 256 prefill chunks the
+    // chunked form cuts a 57K-source PFlash TTFT from ~35 s to ~28 s.
+    static const int chunked_min_tokens = []() {
+        const char * e = std::getenv("DFLASH27B_CHUNKED_MIN_TOKENS");
+        return e ? std::atoi(e) : 64;
+    }();
+    const bool chunked_eligible = (!parent_ids && !cap &&
+                                   n_seq_tokens >= chunked_min_tokens);
+    const bool use_chunked = chunked_eligible && chunked_mode == 1;
 
     ggml_tensor * output = nullptr;
     ggml_tensor * new_state = nullptr;
 
     if (use_chunked) {
         auto r = build_delta_net_chunked(ctx, q_c, k_c, v_c, g_tensor, beta, s);
-        output    = r.output;
-        new_state = r.new_state;
+        // Materialize both results. r.output is a permuted non-contiguous
+        // view; r.new_state is a reshape over the chunk loop's last add —
+        // downstream consumers (gated norm, the state persist cpy) assume
+        // the fused kernel's contiguous layouts.
+        output    = ggml_cont(ctx, r.output);
+        new_state = ggml_cont(ctx, r.new_state);
         goto after_delta_net;
     }
 
@@ -859,6 +879,42 @@ static ggml_tensor * build_delta_net_block(
         S_v * S_v * r_elt,
         S_v * S_v * H_v * r_elt,
         S_v * H_v * n_seq_tokens * n_seqs * r_elt);
+
+    // A/B debug: run the chunked path against the just-computed sequential
+    // result and expose L1 diffs of the output and the final state.
+    // MUST be emitted BEFORE the persist cpy below: ggml-cuda executes
+    // nodes in build order and tracks no buffer aliasing for views, so a
+    // chunked subgraph built after the cpy would read the POST-update
+    // ssm_state through `s` and report phantom diffs.
+    //
+    // Mode 3: same dual computation, but SERVE the chunked output and
+    // chunked final state (sequential runs only as a shadow reference).
+    // Discriminates "chunked results are bad when consumed" from "the
+    // chunked-only graph topology (the goto path) is what breaks".
+    if ((chunked_mode == 2 || chunked_mode == 3) && chunked_eligible) {
+        auto r = build_delta_net_chunked(ctx, q_c, k_c, v_c, g_tensor, beta, s);
+        static int g_ab_counter = 0;
+        char nm[64];
+        ggml_tensor * o_c = ggml_cont(ctx, r.output);
+        ggml_tensor * s_c = ggml_cont(ctx, r.new_state);
+        ggml_tensor * d_o = ggml_sum(ctx, ggml_abs(ctx, ggml_sub(ctx,
+            o_c, ggml_cont(ctx, output))));
+        std::snprintf(nm, sizeof nm, "dnet_ab_o_%d", g_ab_counter);
+        ggml_set_name(d_o, nm);
+        ggml_set_output(d_o);
+        ggml_build_forward_expand(gf, d_o);
+        ggml_tensor * d_s = ggml_sum(ctx, ggml_abs(ctx, ggml_sub(ctx,
+            s_c, ggml_cont(ctx, new_state))));
+        std::snprintf(nm, sizeof nm, "dnet_ab_s_%d", g_ab_counter);
+        ggml_set_name(d_s, nm);
+        ggml_set_output(d_s);
+        ggml_build_forward_expand(gf, d_s);
+        g_ab_counter++;
+        if (chunked_mode == 3) {
+            output    = o_c;
+            new_state = s_c;
+        }
+    }
 
     // Persist new_state back to cache
     ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, ssm_state));
@@ -897,13 +953,13 @@ static ggml_tensor * build_delta_net_block(
     } // end of block started at `{` before `const int64_t S_v = head_v_dim;`
 
 after_delta_net:
-    // Chunked path writes directly into the same ssm_state slot via its 4D
-    // view `s` (which is a live view over ssm_state), using the same cpy
-    // pattern the sequential path uses for `new_state`. Sequential path's
-    // cpy was already emitted above; guard this second cpy on use_chunked
-    // so we don't double-write.
+    // Chunked path: persist the materialized final state into the raw
+    // ssm_state cache tensor, mirroring the sequential path's cpy exactly
+    // (same dst tensor, not the `s` reshape view). Sequential path's cpy
+    // was already emitted above; guard on use_chunked so we don't
+    // double-write.
     if (use_chunked) {
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, s));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, ssm_state));
     }
 
     // ── Gated output norm: rms_norm(output) * silu(z_4d)

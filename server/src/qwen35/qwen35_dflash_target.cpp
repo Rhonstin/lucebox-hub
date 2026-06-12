@@ -85,6 +85,7 @@ bool Qwen35DFlashTarget::verify_batch(
         std::fprintf(stderr, "verify_batch: compute failed (status=%d)\n", (int)st);
         return false;
     }
+    dnet_ab_report(sg_, "verify");
 
     // Read argmax results from GPU.
     std::vector<int32_t> argmax_buf(n_tokens);

@@ -37,6 +37,11 @@ export GGML_CUDA_FORCE_MMQ="${GGML_CUDA_FORCE_MMQ:-1}"
 # (sampled or greedy). Measured: +29% decode at 57K ctx temp 1.0
 # (23.7 -> 30.6 tok/s), +6-10% on short prompts, 12/12 tool calls.
 export DFLASH_TREE_VERIFY="${DFLASH_TREE_VERIFY:-1}"
+# Chunked delta-net for prefill-sized batches (>=64 tokens; spec verify and
+# replay stay on the fused sequential kernel, which is faster at n<=23).
+# Parallelizes the per-token delta-net loop across each 256-token prefill
+# chunk: 57K-source PFlash TTFT ~35 s -> ~28 s.
+export DFLASH27B_CHUNKED="${DFLASH27B_CHUNKED:-1}"
 
 exec "$BIN" "$MODELS/Qwen3.6-27B-Q4_K_M.gguf" \
   --draft "$MODELS/dflash-draft-3.6-q4_k_m.gguf" \
