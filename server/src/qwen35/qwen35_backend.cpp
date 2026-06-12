@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -1324,6 +1325,118 @@ bool Qwen35Backend::sync_remote_draft_features(int start_pos, int n_tokens) {
 
 // ── DFlash speculative decode loop ─────────────────────────────────────
 
+// DFLASH_TREE_SELFTEST=1: cross-check the tree verify forward against the
+// chain verify forward on the same tokens. (a) The chain-seeded part of the
+// tree (flat nodes 1..chain_depth) must produce the same per-position argmax
+// and logits as verify_batch over the identical token chain — this validates
+// positions, the tree attention mask and sequential recurrent-state routing.
+// (b) The deepest off-chain node, re-verified as a standalone root-to-node
+// chain, must match its tree logits row — this validates the branch-reload
+// path (parent_ids != t-1) in the conv and delta-net tree kernels.
+// Caller must redo snapshot + verify_tree afterwards: this clobbers the
+// step graph state and KV snapshot.
+static void run_tree_selftest(DFlashTarget * target, const DDTree & tree,
+                              const std::vector<int32_t> & draft_tok,
+                              int committed,
+                              const std::vector<int32_t> & tree_argmax) {
+    const int N = 1 + tree.n_nodes;
+    std::vector<float> tree_logits;
+    const bool have_logits = target->read_verify_logits(N, tree_logits);
+    const int vocab = have_logits ? (int)(tree_logits.size() / (size_t)N) : 0;
+
+    auto max_row_diff = [&](const std::vector<float> & a, int row_a,
+                            int node_flat) {
+        float md = 0.0f;
+        const float * pa = a.data() + (size_t)row_a * vocab;
+        const float * pb = tree_logits.data() + (size_t)node_flat * vocab;
+        for (int v = 0; v < vocab; v++) {
+            const float d = std::fabs(pa[v] - pb[v]);
+            if (d > md) md = d;
+        }
+        return md;
+    };
+
+    // (a) chain parity over the chain-seeded prefix of the tree.
+    int chain_depth = 0;
+    for (int i = 0; i < tree.n_nodes; i++) {
+        if (tree.depths[i] != i + 1 || tree.parents[i + 1] != i ||
+            (i + 1 < (int)draft_tok.size() && tree.token_ids[i] != draft_tok[i + 1])) {
+            break;
+        }
+        if (i + 1 >= (int)draft_tok.size()) break;
+        chain_depth = i + 1;
+    }
+    if (chain_depth > 0) {
+        target->restore_kv();
+        target->snapshot_kv();
+        std::vector<int32_t> chain_tok(draft_tok.begin(),
+                                       draft_tok.begin() + chain_depth + 1);
+        int last = -1;
+        std::vector<int32_t> chain_argmax;
+        if (target->verify_batch(chain_tok, committed, last, &chain_argmax)) {
+            int mism = 0;
+            for (int i = 0; i <= chain_depth && i < (int)chain_argmax.size(); i++) {
+                if (chain_argmax[i] != tree_argmax[i]) {
+                    if (mism < 4) {
+                        std::fprintf(stderr, "[tree-selftest] CHAIN argmax mismatch "
+                                     "pos=%d chain=%d tree=%d\n",
+                                     i, chain_argmax[i], tree_argmax[i]);
+                    }
+                    mism++;
+                }
+            }
+            float max_d = -1.0f;
+            std::vector<float> chain_logits;
+            if (have_logits &&
+                target->read_verify_logits(chain_depth + 1, chain_logits)) {
+                max_d = 0.0f;
+                for (int i = 0; i <= chain_depth; i++) {
+                    const float d = max_row_diff(chain_logits, i, i);
+                    if (d > max_d) max_d = d;
+                }
+            }
+            std::fprintf(stderr, "[tree-selftest] chain parity depth=%d "
+                         "argmax_mismatches=%d max_logit_diff=%.5f\n",
+                         chain_depth, mism, max_d);
+        } else {
+            std::fprintf(stderr, "[tree-selftest] chain verify_batch failed\n");
+        }
+    }
+
+    // (b) branch parity on the deepest off-chain node (last flat node: the
+    // best-first heap appends after the chain seed, so it always has a
+    // branch transition in its lineage when n_nodes > chain_depth).
+    if (tree.n_nodes > chain_depth) {
+        const int node = tree.n_nodes;
+        std::vector<int32_t> path;
+        for (int v = node; v != 0; v = tree.parents[v]) {
+            path.push_back(tree.token_ids[v - 1]);
+        }
+        path.push_back(draft_tok[0]);
+        std::reverse(path.begin(), path.end());
+
+        target->restore_kv();
+        target->snapshot_kv();
+        int last = -1;
+        std::vector<int32_t> pa;
+        if (target->verify_batch(path, committed, last, &pa)) {
+            const bool am_ok = (last == tree_argmax[node]);
+            float max_d = -1.0f;
+            std::vector<float> pl;
+            if (have_logits &&
+                target->read_verify_logits((int)path.size(), pl)) {
+                max_d = max_row_diff(pl, (int)path.size() - 1, node);
+            }
+            std::fprintf(stderr, "[tree-selftest] branch parity node=%d depth=%d "
+                         "path_len=%d argmax_match=%d max_logit_diff=%.5f\n",
+                         node, tree.depths[node - 1], (int)path.size(),
+                         (int)am_ok, max_d);
+        } else {
+            std::fprintf(stderr, "[tree-selftest] branch verify_batch failed\n");
+        }
+    }
+}
+
 bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
@@ -1369,6 +1482,27 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     const bool sampled_verify = kSampledVerify &&
         sampler_.needs_logit_processing() &&
         cfg_.fa_window == 0;
+
+    // DDTree tree verify: instead of verifying the draft's single top-1
+    // chain, verify a best-first token tree built from the draft's per-
+    // position top-K distributions (--ddtree-budget nodes per step). One
+    // tree forward replaces the chain forward; the acceptance walk follows
+    // the target through tree branches, so a single early divergence no
+    // longer discards the rest of the block. Opt in with
+    // DFLASH_TREE_VERIFY=1 (requires --ddtree). Gated to fa_window == 0 for
+    // the same logit-tail reason as sampled-verify.
+    static const bool kTreeVerify = []() {
+        const char * e = std::getenv("DFLASH_TREE_VERIFY");
+        return e != nullptr && std::string(e) == "1";
+    }();
+    static const int kTreeTopK = []() {
+        const char * e = std::getenv("DFLASH_TREE_TOPK");
+        const int k = e ? std::atoi(e) : 4;
+        return std::max(2, std::min(8, k));
+    }();
+    const bool tree_verify = kTreeVerify && cfg_.ddtree_mode &&
+        cfg_.fa_window == 0 &&
+        (!sampler_.needs_logit_processing() || sampled_verify);
 
     // Check if we can use speculative decode:
     // - draft model loaded and not parked
@@ -1432,17 +1566,25 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     std::vector<int32_t> noise_ids(q_len);
     std::vector<int32_t> draft_tok(q_len);
     std::vector<int32_t> target_tok(q_len);
-    std::vector<float>   verify_logits;   // sampled-verify: [q_len x vocab]
+    std::vector<float>   verify_logits;   // sampled-verify: [n_verify x vocab]
     std::vector<int32_t> verify_history;  // sampled-verify: penalty history
     std::vector<int32_t> pos_q(q_len);
     std::vector<int32_t> pos_k;
     std::vector<float>   local_hidden;
+
+    // DDTree buffers (tree_verify only).
+    std::vector<float>   draft_logits;    // [q_len x vocab] draft projection
+    std::vector<float>   topk_logp;       // [(q_len-1) x K]
+    std::vector<int32_t> topk_ids;        // [(q_len-1) x K]
+    std::vector<int32_t> tree_argmax;     // [1 + n_nodes] per-node argmax
+    std::vector<int32_t> accept_tok;      // accepted tokens incl. seed
 
     int n_generated     = 0;
     int n_draft_steps   = 0;
     int n_accept_sum    = 0;
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
+    int n_tree_steps    = 0;
 
     auto t_dec0 = std::chrono::steady_clock::now();
 
@@ -1602,14 +1744,71 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             io.observer("draft", draft_tok);
         }
 
-        // 4. Verify: snapshot KV, run target forward over draft tokens
+        // 3c. DDTree: build the draft tree from the projection's top-K
+        // distributions. Hint steps stay on the chain path — hints are
+        // pre-known near-100%-accept token runs, a tree adds nothing there.
+        bool tree_step = tree_verify && hint_fill == 0;
+        DDTree tree;
+        if (tree_step) {
+            if (target->read_projection_logits(q_len, draft_logits)) {
+                // Projection row i predicts block position i; row 0 is dead
+                // (the seed replaces it), so levels 1..q_len-1 of the tree
+                // come from rows 1..q_len-1.
+                const int vocab_d = (int)(draft_logits.size() / (size_t)q_len);
+                const int L = q_len - 1;
+                topk_logp.resize((size_t)L * kTreeTopK);
+                topk_ids.resize((size_t)L * kTreeTopK);
+                extract_draft_topk(draft_logits.data() + (size_t)vocab_d,
+                                   L, vocab_d, kTreeTopK,
+                                   topk_logp.data(), topk_ids.data(),
+                                   cfg_.ddtree_temp);
+                tree = build_ddtree(topk_logp.data(), topk_ids.data(),
+                                    L, kTreeTopK, cfg_.ddtree_budget,
+                                    cfg_.ddtree_chain_seed);
+                tree_step = tree.n_nodes > 0;
+            } else {
+                tree_step = false;
+            }
+        }
+
+        // 4. Verify: snapshot KV, run target forward over the draft block
         if (!target->snapshot_kv()) {
             step_graph_destroy(draft_sg);
             return false;
         }
 
         int verify_last_tok = -1;
-        if (!target->verify_batch(draft_tok, committed, verify_last_tok, &target_tok)) {
+        if (tree_step) {
+            if (!target->verify_tree(draft_tok[0], tree, committed, tree_argmax)) {
+                // Tree verify unsupported or failed — chain-verify this step.
+                // Any partial KV writes are repaired by the restore + replay
+                // below, same as a rejected speculative batch.
+                std::fprintf(stderr, "spec-decode: tree verify failed, "
+                             "falling back to chain for this step\n");
+                tree_step = false;
+            } else {
+                n_tree_steps++;
+                static const bool kTreeSelftest = []() {
+                    const char * e = std::getenv("DFLASH_TREE_SELFTEST");
+                    return e != nullptr && std::string(e) == "1";
+                }();
+                if (kTreeSelftest && n_tree_steps <= 3) {
+                    run_tree_selftest(target, tree, draft_tok, committed,
+                                      tree_argmax);
+                    // Selftest clobbered the snapshot and step-graph state;
+                    // redo the tree forward so the acceptance walk below
+                    // reads fresh logits.
+                    target->restore_kv();
+                    target->snapshot_kv();
+                    if (!target->verify_tree(draft_tok[0], tree, committed,
+                                             tree_argmax)) {
+                        tree_step = false;
+                    }
+                }
+            }
+        }
+        if (!tree_step &&
+            !target->verify_batch(draft_tok, committed, verify_last_tok, &target_tok)) {
             std::fprintf(stderr, "spec-decode: verify failed\n");
             target->restore_kv();
             step_graph_destroy(draft_sg);
@@ -1621,9 +1820,60 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // token from the target's sampler chain; accept while the draft
         // guessed the drawn token, and the first mismatch becomes the bonus
         // token (it is already a valid target sample at that position).
+        //
+        // Tree: same walks, but through the tree's child maps — at each
+        // accepted node the target's next token (argmax or sample) picks
+        // among the node's children instead of a single chain successor.
+        // The walk ends at the first token with no matching child; that
+        // token is the bonus (always present in tree mode: even a fully
+        // accepted path yields one more valid next-token at its deepest
+        // node, since that distribution was computed with the whole path
+        // in context).
         int accept_n = 1;
         int bonus_tok = -1;
-        if (sampled_verify) {
+        if (tree_step) {
+            const int n_tree_tok = 1 + tree.n_nodes;
+            accept_tok.clear();
+            accept_tok.push_back(draft_tok[0]);
+            if (sampled_verify) {
+                if (!target->read_verify_logits(n_tree_tok, verify_logits)) {
+                    std::fprintf(stderr, "spec-decode: tree verify logits read failed\n");
+                    target->restore_kv();
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                const int vocab_v = (int)(verify_logits.size() / (size_t)n_tree_tok);
+                // Penalty history must match AR exactly: when AR samples the
+                // token after X, X is already in out_tokens. The root/seed
+                // token is committed by this step's replay but not yet in
+                // out_tokens, so add it before walking.
+                verify_history = out_tokens;
+                verify_history.push_back(draft_tok[0]);
+                int cur = 0;
+                while (true) {
+                    const int s = sample_logits(
+                        verify_logits.data() + (size_t)cur * vocab_v, vocab_v,
+                        sampler_, verify_history, sampler_rng_);
+                    auto it = tree.child_maps[cur].find(s);
+                    if (it == tree.child_maps[cur].end()) {
+                        bonus_tok = s;
+                        break;
+                    }
+                    cur = it->second;
+                    accept_tok.push_back(s);
+                    verify_history.push_back(s);
+                }
+            } else {
+                int next_tok = -1;
+                const std::vector<int> path =
+                    follow_verified_tree(tree, tree_argmax.data(), next_tok);
+                for (size_t pi = 1; pi < path.size(); pi++) {
+                    accept_tok.push_back(tree.token_ids[path[pi] - 1]);
+                }
+                bonus_tok = next_tok;
+            }
+            accept_n = (int)accept_tok.size();
+        } else if (sampled_verify) {
             if (!target->read_verify_logits(q_len, verify_logits)) {
                 std::fprintf(stderr, "spec-decode: verify logits read failed\n");
                 target->restore_kv();
@@ -1710,7 +1960,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
         std::vector<int32_t> replay_tok((size_t)commit_n);
         for (int i = 0; i < commit_n; i++) {
-            replay_tok[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
+            replay_tok[i] = (i < accept_n)
+                ? (tree_step ? accept_tok[i] : draft_tok[i])
+                : bonus_tok;
         }
         int replay_last_tok = -1;
         if (!target->verify_batch(replay_tok, committed, replay_last_tok, nullptr)) {
@@ -1875,11 +2127,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
     out_accept_rate = (float)((double)n_accept_sum / (double)total_draft_pos);
     std::fprintf(stderr, "[spec-decode] tokens=%d time=%.3f s speed=%.2f tok/s "
-                 "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f\n",
+                 "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f tree_steps=%d\n",
                  n_generated, decode_s,
                  n_generated > 0 ? n_generated / decode_s : 0.0,
                  n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
-                 n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
+                 n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0,
+                 n_tree_steps);
     if (n_hint_proposed > 0) {
         std::fprintf(stderr, "[spec-decode] hint tokens: %d/%d accepted (%.1f%%)\n",
                      n_hint_accepted, n_hint_proposed,
