@@ -9,6 +9,7 @@ namespace dflash::common {
 
 Qwen35DFlashTarget::~Qwen35DFlashTarget() {
     step_graph_destroy(proj_sg_);
+    step_graph_destroy(tree_sg_);
 }
 
 Qwen35DFlashTarget::Qwen35DFlashTarget(
@@ -95,16 +96,103 @@ bool Qwen35DFlashTarget::verify_batch(
         *all_argmax = std::move(argmax_buf);
     }
 
+    last_verify_sg_ = &sg_;
     cache_.cur_pos = base_pos + n_tokens;
     return true;
 }
 
+bool Qwen35DFlashTarget::verify_tree(int32_t root_tok,
+                                     const DDTree & tree,
+                                     int base_pos,
+                                     std::vector<int32_t> & all_argmax) {
+    const int N = 1 + tree.n_nodes;
+    const int hidden = w_.n_embd;
+
+    if (!build_target_step_tree(tree_sg_, w_, cache_, backend_,
+                                /*kv_start=*/base_pos, N,
+                                fa_window_, kq_stride_pad_)) {
+        std::fprintf(stderr, "verify_tree: build_target_step_tree failed (base=%d n=%d)\n",
+                     base_pos, N);
+        return false;
+    }
+
+    // Embed [root, tree nodes] in flat order.
+    std::vector<int32_t> tokens(N);
+    tokens[0] = root_tok;
+    for (int i = 0; i < tree.n_nodes; i++) tokens[1 + i] = tree.token_ids[i];
+    std::vector<float> embed((size_t)N * hidden);
+    if (!w_.embedder.embed(tokens.data(), N, embed.data())) {
+        std::fprintf(stderr, "verify_tree: embed failed (n=%d)\n", N);
+        return false;
+    }
+    ggml_backend_tensor_set(tree_sg_.inp_embed, embed.data(), 0,
+                            sizeof(float) * embed.size());
+
+    // RoPE positions follow tree depth, not flat order: a node at depth d
+    // sits at sequence position base_pos + d (root depth 0). Siblings share
+    // a position, exactly like the KV slots they compete for after replay.
+    std::vector<int32_t> pos(4 * N);
+    for (int i = 0; i < N; i++) {
+        const int depth = (i == 0) ? 0 : tree.depths[i - 1];
+        pos[4 * i + 0] = base_pos + depth;
+        pos[4 * i + 1] = base_pos + depth;
+        pos[4 * i + 2] = base_pos + depth;
+        pos[4 * i + 3] = 0;
+    }
+    ggml_backend_tensor_set(tree_sg_.positions, pos.data(), 0,
+                            sizeof(int32_t) * pos.size());
+
+    // Ancestor-only attention mask over past KV + tree block.
+    const int win_start = (fa_window_ > 0 && base_pos > fa_window_)
+                              ? (base_pos - fa_window_) : 0;
+    std::vector<uint16_t> mask_buf;
+    const int kv_pad_override = (int)tree_sg_.attn_mask->ne[0];
+    build_tree_mask(tree, base_pos, mask_buf, kq_stride_pad_,
+                    win_start, kv_pad_override);
+    ggml_backend_tensor_set(tree_sg_.attn_mask, mask_buf.data(), 0,
+                            sizeof(uint16_t) * mask_buf.size());
+
+    // Recurrent-state routing: parent index within the block, -1 for the
+    // root (reload the pre-block state). tree.parents is indexed over the
+    // same flat order (entry 0 = root).
+    std::vector<int32_t> parent_ids(N);
+    parent_ids[0] = -1;
+    for (int i = 1; i < N; i++) parent_ids[i] = tree.parents[i];
+    ggml_backend_tensor_set(tree_sg_.parent_ids, parent_ids.data(), 0,
+                            sizeof(int32_t) * parent_ids.size());
+
+    auto st = ggml_backend_graph_compute(backend_, tree_sg_.gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "verify_tree: compute failed (status=%d)\n", (int)st);
+        return false;
+    }
+
+    all_argmax.resize(N);
+    ggml_backend_tensor_get(tree_sg_.argmax_tokens, all_argmax.data(), 0,
+                            sizeof(int32_t) * N);
+
+    last_verify_sg_ = &tree_sg_;
+    cache_.cur_pos = base_pos + N;
+    return true;
+}
+
 bool Qwen35DFlashTarget::read_verify_logits(int n_tokens, std::vector<float> & out) {
-    if (!sg_.logits || n_tokens <= 0) return false;
-    const int64_t vocab = sg_.logits->ne[0];
-    if (n_tokens > (int)sg_.logits->ne[1]) return false;
+    StepGraph * src = last_verify_sg_ ? last_verify_sg_ : &sg_;
+    if (!src->logits || n_tokens <= 0) return false;
+    const int64_t vocab = src->logits->ne[0];
+    if (n_tokens > (int)src->logits->ne[1]) return false;
     out.resize((size_t)n_tokens * (size_t)vocab);
-    ggml_backend_tensor_get(sg_.logits, out.data(), 0,
+    ggml_backend_tensor_get(src->logits, out.data(), 0,
+                            sizeof(float) * out.size());
+    return true;
+}
+
+bool Qwen35DFlashTarget::read_projection_logits(int n_tokens, std::vector<float> & out) {
+    if (!proj_sg_.logits || n_tokens <= 0) return false;
+    const int64_t vocab = proj_sg_.logits->ne[0];
+    if (n_tokens > (int)proj_sg_.logits->ne[1]) return false;
+    out.resize((size_t)n_tokens * (size_t)vocab);
+    ggml_backend_tensor_get(proj_sg_.logits, out.data(), 0,
                             sizeof(float) * out.size());
     return true;
 }

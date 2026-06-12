@@ -39,6 +39,13 @@ public:
 
     bool read_verify_logits(int n_tokens, std::vector<float> & out) override;
 
+    bool verify_tree(int32_t root_tok,
+                     const DDTree & tree,
+                     int base_pos,
+                     std::vector<int32_t> & all_argmax) override;
+
+    bool read_projection_logits(int n_tokens, std::vector<float> & out) override;
+
     bool snapshot_kv() override;
     bool restore_kv() override;
 
@@ -68,6 +75,15 @@ private:
 
     // LM-head projection graph (lazily built).
     StepGraph proj_sg_;
+
+    // DDTree verify graph (lazily built; separate from sg_ so the chain
+    // replay graph and the tree verify graph don't clobber each other).
+    StepGraph tree_sg_;
+
+    // Which step graph produced the most recent verify logits — sg_ after
+    // verify_batch, tree_sg_ after verify_tree. read_verify_logits reads
+    // from here.
+    StepGraph * last_verify_sg_ = nullptr;
 };
 
 }  // namespace dflash::common

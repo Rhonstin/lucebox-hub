@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "ddtree.h"
+
 #include <cstdint>
 #include <vector>
 
@@ -34,10 +36,35 @@ struct DFlashTarget {
                               std::vector<int32_t> * all_argmax = nullptr) = 0;
 
     // Read the full [n_tokens x vocab] f32 logits produced by the most
-    // recent verify_batch call. Used by sampled-verify (spec decode with
-    // temperature). Returns false when the implementation does not keep
-    // verify logits around.
+    // recent verify_batch / verify_tree call. Used by sampled-verify (spec
+    // decode with temperature). Returns false when the implementation does
+    // not keep verify logits around.
     virtual bool read_verify_logits(int n_tokens, std::vector<float> & out) {
+        (void)n_tokens; (void)out;
+        return false;
+    }
+
+    // Tree-structured verify (DDTree). Runs the target forward over
+    // [root_tok, tree.token_ids...] with ancestor-only attention, per-depth
+    // RoPE positions and tree-aware recurrent-state routing. Fills
+    // `all_argmax` with the per-node argmax ([1 + tree.n_nodes] entries,
+    // index 0 = root). Per-node logits are readable afterwards via
+    // read_verify_logits(1 + tree.n_nodes, ...). Returns false when the
+    // implementation does not support tree verify (caller falls back to
+    // chain verify).
+    virtual bool verify_tree(int32_t root_tok,
+                             const DDTree & tree,
+                             int base_pos,
+                             std::vector<int32_t> & all_argmax) {
+        (void)root_tok; (void)tree; (void)base_pos; (void)all_argmax;
+        return false;
+    }
+
+    // Read the full [n_tokens x vocab] f32 logits produced by the most
+    // recent project_hidden_to_tokens call. Used by DDTree to extract the
+    // draft's per-position top-K distributions. Returns false when the
+    // implementation does not keep projection logits around.
+    virtual bool read_projection_logits(int n_tokens, std::vector<float> & out) {
         (void)n_tokens; (void)out;
         return false;
     }

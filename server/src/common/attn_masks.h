@@ -51,13 +51,18 @@ inline void build_causal_mask(std::vector<uint16_t> & out,
 // Build an ancestor-only attention mask for DDTree tree-structured verify.
 // Each query position i can attend to its ancestors in the tree (including
 // itself) plus all past KV positions.
+// kv_pad_override: when >0, overrides the kv_pad (row stride) calculation.
+//   Use this when the mask tensor is pre-sized to max_ctx (see
+//   build_causal_mask). The excess positions are filled with -inf.
 inline void build_tree_mask(const DDTree & tree, int past_length,
                             std::vector<uint16_t> & out_mask,
                             int kq_stride_pad,
-                            int win_start = 0) {
+                            int win_start = 0,
+                            int kv_pad_override = 0) {
     const int N       = 1 + tree.n_nodes;
     const int win_len = past_length + N - win_start;
-    const int kv_pad  = align_up(win_len, kq_stride_pad);
+    const int kv_pad  = (kv_pad_override > 0) ? kv_pad_override
+                                              : align_up(win_len, kq_stride_pad);
     const int q_pad   = align_up(N, KQ_MASK_PAD);
     out_mask.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
     for (int q = 0; q < N; q++) {
