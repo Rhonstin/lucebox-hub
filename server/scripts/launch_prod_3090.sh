@@ -47,4 +47,6 @@ exec "$BIN" "$MODELS/Qwen3.6-27B-Q4_K_M.gguf" \
   --prefill-curve 16000:0.5 40000:0.2 100000:0.1 139264:0.05 \
   --prefill-drafter "$MODELS/Qwen3-0.6B-BF16.gguf" \
   --draft-residency request-scoped \
+  --kv-cache-dir /mnt/models/.cache/dflash-kv \
+  --kv-cache-budget 16384 \
   --model-name qwen3.6-27b
