@@ -1371,7 +1371,16 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         const char * e = std::getenv("DFLASH_SAMPLED_VERIFY");
         return e == nullptr || std::string(e) != "0";
     }();
-    const bool sampled_verify = kSampledVerify && sampler_.needs_logit_processing();
+    // Sampled-verify additionally requires full attention in the verify
+    // path. With a finite --fa-window the verify batch applies one
+    // window-start to the whole batch (unlike the AR step graph, which is
+    // hardcoded to full attention): the argmax stays robust, so greedy
+    // verification is unaffected, but the logit TAIL drifts at long
+    // context and top-k sampling draws degenerate tokens from it
+    // (reproduced at 24K: 0/12 tool calls with fa-window 2048, 4/4 with 0).
+    const bool sampled_verify = kSampledVerify &&
+        sampler_.needs_logit_processing() &&
+        cfg_.fa_window == 0;
 
     // Check if we can use speculative decode:
     // - draft model loaded and not parked
@@ -1664,6 +1673,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 const int s = sample_logits(
                     verify_logits.data() + (size_t)i * vocab_v, vocab_v,
                     sampler_, verify_history, sampler_rng_);
+                if (kSvDebug && n_draft_steps < 3 && i < 4) {
+                    std::fprintf(stderr,
+                        "[sv-debug] step=%d pos=%d seed/draft0=%d draft=%d "
+                        "sampled=%d\n",
+                        n_draft_steps, i, draft_tok[0], draft_tok[i + 1], s);
+                }
                 if (draft_tok[i + 1] == s) {
                     accept_n++;
                     verify_history.push_back(s);
