@@ -20,6 +20,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -2932,6 +2933,29 @@ void HttpServer::worker_loop() {
         const std::string finish = client_disconnected
             ? "client_disconnect"
             : (result.ok ? emitter.finish_reason() : "error");
+
+        // DFLASH_TRAFFIC_LOG=<path>: append one JSONL record per completed
+        // chat request — raw request body, final text, and the raw generated
+        // token ids (faithful labels incl. <think>/<tool_call> markup that
+        // the emitter strips). For building draft fine-tune datasets from
+        // real traffic. Off unless the env is set; the file stays local.
+        static const char * traffic_log = std::getenv("DFLASH_TRAFFIC_LOG");
+        if (traffic_log && result.ok && !client_disconnected) {
+            json rec = {
+                {"ts", (long long)std::time(nullptr)},
+                {"request", req.raw_body},
+                {"response_text", emitter.accumulated_text()},
+                {"response_token_ids", result.tokens},
+                {"finish", finish},
+                {"prompt_tokens", (long long)req.prompt_tokens.size()},
+                {"out_tokens", out_tokens},
+            };
+            if (std::FILE * tf = std::fopen(traffic_log, "a")) {
+                const std::string line = rec.dump() + "\n";
+                std::fwrite(line.data(), 1, line.size(), tf);
+                std::fclose(tf);
+            }
+        }
 
         std::fprintf(stderr,
             "[server] chat DONE %s ok=%s in=%zu effective_in=%zu out=%d "

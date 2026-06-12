@@ -42,15 +42,19 @@ export DFLASH_TREE_VERIFY="${DFLASH_TREE_VERIFY:-1}"
 # Parallelizes the per-token delta-net loop across each 256-token prefill
 # chunk: 57K-source PFlash TTFT ~35 s -> ~28 s.
 export DFLASH27B_CHUNKED="${DFLASH27B_CHUNKED:-1}"
+# Traffic capture for the draft fine-tune dataset: one JSONL record per
+# completed chat (raw request + response text + raw token ids). Local file
+# only. REMOVE this line (or set empty) to stop collecting.
+export DFLASH_TRAFFIC_LOG="${DFLASH_TRAFFIC_LOG:-/mnt/models/.cache/dflash-traffic.jsonl}"
 
 exec "$BIN" "$MODELS/Qwen3.6-27B-Q4_K_M.gguf" \
   --draft "$MODELS/dflash-draft-3.6-q4_k_m.gguf" \
   --draft-swa 2048 \
   --host 0.0.0.0 --port "$PORT" \
-  --max-ctx 114688 \
+  --max-ctx 116688 \
   --chunk 256 \
   --fa-window 0 \
-  --cache-type-k q4_0 --cache-type-v q4_0 \
+  --cache-type-k tq3_0 --cache-type-v tq3_0 \
   --ddtree --ddtree-budget 22 \
   --prefill-compression auto \
   --prefill-threshold 16000 \
