@@ -137,6 +137,29 @@ is token 25 and is present in `stall_action_suffix_tokens` (the bare
 
 ---
 
+## ⚠️ LIVE FAILURE 2026-06-15 — trigger too broad, caused degeneration
+
+Enabled in prod, the guard fired correctly on real spec-path stalls (10x,
+rescued to finish=tool_calls) BUT also fired on a **legitimate
+colon-ending TEXT turn**: the model presented `🔑 API ключ:` to the user and
+intended to STOP. The guard saw the recent ':' , suppressed the EOS, injected
+the tool prefix, and forced the model past its natural stop → it degenerated
+into a `🔑` repetition loop to the token cap. Disabled (commit 2c5e324).
+
+ROOT CAUSE: `tokens_have_recent_any(out_tokens, action_suffix, 16)` matches a
+colon ANYWHERE in the last 16 tokens — it cannot distinguish an action
+preamble ("Let me check:") from a colon in ordinary prose ("API ключ:",
+"options:", "приклад:"). Many normal assistant turns end on ':' without
+intending a tool call.
+
+REQUIRED before re-enabling: narrow the trigger so it only fires when the
+colon is the **last non-whitespace emitted token** (i.e. the response ends
+exactly on ':' with nothing after), AND ideally only when tool_choice
+indicates a tool is expected. Even then, prefer suppress-EOS-and-continue
+(let the model decide) over force-injecting the tool prefix, OR cap the
+post-injection continuation and bail to a clean stop if it doesn't produce a
+tool_call within N tokens (so a wrong guess can't loop to the cap).
+
 ## Risks
 
 - **Legitimate `:`-ending text turns** (rare for agents: "Here are the
