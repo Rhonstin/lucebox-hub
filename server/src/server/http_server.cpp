@@ -1830,16 +1830,10 @@ void HttpServer::worker_loop() {
             } else if (config_.pflash_mode == ServerConfig::PflashMode::AUTO) {
                 should_compress = (n_prompt >= config_.pflash_threshold);
             }
-            // Tool-calling requests skip compression so JSON tool definitions
-            // stay intact (mirrors the pre-check exemption above).
-            if (should_compress && json_array_size(req.tools) > 0) {
-                std::fprintf(stderr,
-                    "[pflash] tools present (%zu) — skipping compression\n",
-                    json_array_size(req.tools));
-                should_compress = false;
-            }
+            const bool tools_present = json_array_size(req.tools) > 0;
 
             // Detect whether this is a multi-turn continuation.
+            // Must run BEFORE the tools gate so we know if FlowKV applies.
             bool is_continuation = false;
             if (should_compress && req.messages.is_array()) {
                 for (const auto & _m : req.messages) {
@@ -1867,11 +1861,25 @@ void HttpServer::worker_loop() {
                 }
             }
 
+            // Tool-calling requests: allow FlowKV continuation when env-enabled,
+            // but always block whole-prompt PFlash (tool schemas would be lost).
+            static const bool kFlowKvTools = [](){
+                const char * e = std::getenv("DFLASH_FLOWKV_TOOLS");
+                return e != nullptr && std::string(e) == "1";
+            }();
+            if (should_compress && tools_present &&
+                !(kFlowKvTools && is_continuation)) {
+                std::fprintf(stderr,
+                    "[pflash] tools present (%zu) — skipping compression\n",
+                    json_array_size(req.tools));
+                should_compress = false;
+            }
+
             // FlowKV: compress aged msgs[1..n-hot_window) once per session; system + hot tail verbatim.
             if (should_compress && is_continuation && req.disk_cache_policy.compress &&
                 req.messages.is_array())
             {
-                int hot_window = 2;
+                int hot_window = (tools_present ? 4 : 2);
                 {
                     const char * hwe = std::getenv("PFLASH_FREEZE_HOT_WINDOW");
                     if (hwe && *hwe) {
@@ -1939,7 +1947,19 @@ void HttpServer::worker_loop() {
                             if (msg_content.empty()) continue;
 
                             auto msg_drafter_ids = drafter_tokenizer_->encode(msg_content);
-                            if ((int)msg_drafter_ids.size() < config_.pflash_threshold) continue;
+                            // Per-aged-message compression floor. The whole-prompt PFlash
+                            // trigger (config_.pflash_threshold, ~16K) is far too high for a
+                            // FlowKV aged message: agent histories are many 1-5K-token
+                            // messages, none individually near 16K, so the global threshold
+                            // skips them all and FlowKV never compresses. Use a separate,
+                            // lower floor (DFLASH_FLOWKV_MSG_MIN, default 1024) so aged
+                            // agent turns compress while single-shot PFlash stays at 16K.
+                            static const int kFlowKvMsgMin = [](){
+                                const char * e = std::getenv("DFLASH_FLOWKV_MSG_MIN");
+                                const int v = e ? std::atoi(e) : 1024;
+                                return v > 0 ? v : 1024;
+                            }();
+                            if ((int)msg_drafter_ids.size() < kFlowKvMsgMin) continue;
 
                             const PrefixHash msg_key = frozen_block_key(
                                 msg_drafter_ids.data(), 0, (int)msg_drafter_ids.size());
@@ -2066,7 +2086,7 @@ void HttpServer::worker_loop() {
                     "[flowkv] turn-1 verbatim (system kept as cache anchor)\n");
             }
 
-            if (should_compress) {
+            if (should_compress && !tools_present) {
                 // Check full-compress cache FIRST — if we've seen this exact
                 // raw prompt before, skip the expensive compress cycle entirely.
                 auto [full_slot, full_len] = prefix_cache_.lookup_full(req.prompt_tokens);
