@@ -53,6 +53,14 @@ export DFLASH_TRAFFIC_LOG="${DFLASH_TRAFFIC_LOG:-/mnt/models/.cache/dflash-traff
 # tools 12/12. Requires --disk-prefix-cache-compress (below). The per-aged-
 # message floor defaults to 1024 (override DFLASH_FLOWKV_MSG_MIN).
 export DFLASH_FLOWKV_TOOLS="${DFLASH_FLOWKV_TOOLS:-1}"
+# Colon-aware tool-call guard: when the model emits an action preamble ending
+# in ':' then tries to EOS without a tool_call (the intermittent agent stall),
+# suppress the EOS and inject the tool-call prefix so the turn completes.
+# Surgical (only fires on EOS right after a recent ':' on tool requests) and
+# wired into both the spec and AR decode paths. Needs both vars: GUARD enables
+# the injection, STALL_TOOL_PREFIX populates the prefix/suffix token sets.
+export DFLASH_COLON_TOOL_GUARD="${DFLASH_COLON_TOOL_GUARD:-1}"
+export DFLASH_STALL_TOOL_PREFIX="${DFLASH_STALL_TOOL_PREFIX:-1}"
 
 exec "$BIN" "$MODELS/Qwen3.6-27B-Q4_K_M.gguf" \
   --draft "$MODELS/dflash-draft-3.6-q4_k_m.gguf" \
