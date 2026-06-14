@@ -46,6 +46,13 @@ export DFLASH27B_CHUNKED="${DFLASH27B_CHUNKED:-1}"
 # completed chat (raw request + response text + raw token ids). Local file
 # only. REMOVE this line (or set empty) to stop collecting.
 export DFLASH_TRAFFIC_LOG="${DFLASH_TRAFFIC_LOG:-/mnt/models/.cache/dflash-traffic.jsonl}"
+# FlowKV on tool-calling continuations: compress aged conversation history
+# (system + tool schemas + last 4 turns stay verbatim) so long agent prompts
+# don't re-prefill uncompressed. Validated: real 112K/124-tool prompt
+# 359 s -> 145 s prefill; cited facts survive 50% aged-message compression;
+# tools 12/12. Requires --disk-prefix-cache-compress (below). The per-aged-
+# message floor defaults to 1024 (override DFLASH_FLOWKV_MSG_MIN).
+export DFLASH_FLOWKV_TOOLS="${DFLASH_FLOWKV_TOOLS:-1}"
 
 exec "$BIN" "$MODELS/Qwen3.6-27B-Q4_K_M.gguf" \
   --draft "$MODELS/dflash-draft-3.6-q4_k_m.gguf" \
@@ -63,4 +70,5 @@ exec "$BIN" "$MODELS/Qwen3.6-27B-Q4_K_M.gguf" \
   --draft-residency request-scoped \
   --kv-cache-dir /mnt/models/.cache/dflash-kv \
   --kv-cache-budget 16384 \
+  --disk-prefix-cache-compress \
   --model-name qwen3.6-27b
