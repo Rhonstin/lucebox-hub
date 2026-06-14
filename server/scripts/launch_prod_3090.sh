@@ -52,7 +52,7 @@ export DFLASH_TRAFFIC_LOG="${DFLASH_TRAFFIC_LOG:-/mnt/models/.cache/dflash-traff
 # 359 s -> 145 s prefill; cited facts survive 50% aged-message compression;
 # tools 12/12. Requires --disk-prefix-cache-compress (below). The per-aged-
 # message floor defaults to 1024 (override DFLASH_FLOWKV_MSG_MIN).
-export DFLASH_FLOWKV_TOOLS="${DFLASH_FLOWKV_TOOLS:-1}"
+export DFLASH_FLOWKV_TOOLS="${DFLASH_FLOWKV_TOOLS:-0}"  # DISABLED 2026-06-15: suspected of breaking tool-calling (compresses tool history)
 # Colon-aware tool-call guard: when the model emits an action preamble ending
 # in ':' then tries to EOS without a tool_call (the intermittent agent stall),
 # suppress the EOS and inject the tool-call prefix so the turn completes.
@@ -78,5 +78,4 @@ exec "$BIN" "$MODELS/Qwen3.6-27B-Q4_K_M.gguf" \
   --draft-residency request-scoped \
   --kv-cache-dir /mnt/models/.cache/dflash-kv \
   --kv-cache-budget 16384 \
-  --disk-prefix-cache-compress \
   --model-name qwen3.6-27b
