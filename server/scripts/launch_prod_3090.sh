@@ -59,8 +59,8 @@ export DFLASH_FLOWKV_TOOLS="${DFLASH_FLOWKV_TOOLS:-1}"
 # Surgical (only fires on EOS right after a recent ':' on tool requests) and
 # wired into both the spec and AR decode paths. Needs both vars: GUARD enables
 # the injection, STALL_TOOL_PREFIX populates the prefix/suffix token sets.
-export DFLASH_COLON_TOOL_GUARD="${DFLASH_COLON_TOOL_GUARD:-1}"
-export DFLASH_STALL_TOOL_PREFIX="${DFLASH_STALL_TOOL_PREFIX:-1}"
+export DFLASH_COLON_TOOL_GUARD="${DFLASH_COLON_TOOL_GUARD:-0}"  # DISABLED 2026-06-15: caused emoji-loop degeneration on legitimate colon-ending text turns
+export DFLASH_STALL_TOOL_PREFIX="${DFLASH_STALL_TOOL_PREFIX:-0}"  # DISABLED with colon-guard
 
 exec "$BIN" "$MODELS/Qwen3.6-27B-Q4_K_M.gguf" \
   --draft "$MODELS/dflash-draft-3.6-q4_k_m.gguf" \
