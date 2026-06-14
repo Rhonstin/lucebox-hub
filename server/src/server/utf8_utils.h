@@ -20,6 +20,29 @@ inline size_t utf8_safe_len(const std::string & s, size_t pos) {
     return pos;
 }
 
+// Length of the prefix of `s` that ends on a complete UTF-8 codepoint.
+// If `s` ends mid-sequence (a lead byte without all its continuation
+// bytes yet), returns the offset of that dangling lead byte so the caller
+// can hold the incomplete tail back for the next chunk. A complete (or
+// invalid-lead) final sequence yields s.size(). Used to reassemble
+// codepoints split across streaming token boundaries.
+inline size_t utf8_complete_len(const std::string & s) {
+    if (s.empty()) return 0;
+    size_t i = s.size() - 1;
+    // Walk back over continuation bytes to the lead byte of the last seq.
+    while (i > 0 && ((uint8_t)s[i] & 0xC0) == 0x80) i--;
+    uint8_t c = (uint8_t)s[i];
+    size_t need;
+    if (c < 0x80) need = 1;
+    else if ((c & 0xE0) == 0xC0) need = 2;
+    else if ((c & 0xF0) == 0xE0) need = 3;
+    else if ((c & 0xF8) == 0xF0) need = 4;
+    else return s.size();  // invalid lead — don't hold back; sanitize fixes it
+    const size_t have = s.size() - i;
+    if (have >= need) return s.size();  // last sequence is complete
+    return i;                           // incomplete tail: hold back from i
+}
+
 // Sanitize a string for JSON: replace invalid/incomplete UTF-8 with U+FFFD.
 inline std::string utf8_sanitize(const std::string & s) {
     std::string out;

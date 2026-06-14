@@ -239,8 +239,16 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
     }
     emit_token_count_++;
 
-    // Sanitize input to prevent json::dump() from throwing on invalid UTF-8.
-    std::string piece = utf8_sanitize(raw_piece);
+    // Reassemble multi-byte UTF-8 codepoints split across token boundaries:
+    // hold the incomplete trailing bytes of this token and prepend them to
+    // the next. Without this, a 4-byte emoji tokenized as [..F0 9F][93 8B..]
+    // sanitizes per-token into four U+FFFD replacement chars (the "����"
+    // artifact) instead of the intended glyph. Then sanitize the completed
+    // prefix to keep json::dump() from throwing on any genuinely bad bytes.
+    std::string carried = pending_utf8_ + raw_piece;
+    size_t complete = utf8_complete_len(carried);
+    pending_utf8_ = carried.substr(complete);
+    std::string piece = utf8_sanitize(carried.substr(0, complete));
     std::vector<std::string> out;
     accumulated_raw_ += piece;
     window_ += piece;
@@ -477,6 +485,14 @@ void SseEmitter::emit_content_delta(std::vector<std::string> & out,
 std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                                                  const GenTimings * timings) {
     std::vector<std::string> out;
+
+    // Flush any held UTF-8 tail. At a clean stop this is empty; if generation
+    // truly ended mid-codepoint the leftover bytes are genuinely truncated, so
+    // sanitizing them to U+FFFD is the correct final representation.
+    if (!pending_utf8_.empty()) {
+        window_ += utf8_sanitize(pending_utf8_);
+        pending_utf8_.clear();
+    }
 
     // Flush remaining window
     if (mode_ == StreamMode::REASONING && !window_.empty()) {

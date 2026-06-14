@@ -144,6 +144,7 @@ private:
 
     StreamMode   mode_;
     std::string  window_;           // holdback buffer
+    std::string  pending_utf8_;     // incomplete UTF-8 tail carried across tokens
     std::string  tool_buffer_;      // accumulated tool text
     std::string  accumulated_content_;
     std::string  accumulated_raw_;  // all raw text for tool memory
