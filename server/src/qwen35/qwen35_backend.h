@@ -182,6 +182,7 @@ protected:
     int  kvflash_tokens_ = 0;                       // 0 = off
     int  kvflash_tau_    = 64;
     bool kvflash_drafter_failed_ = false;           // don't retry a failed load
+    bool kvflash_initial_reselect_enabled_ = false; // DFLASH_KVFLASH_INITIAL_RESELECT
     bool kvflash_active() const { return kvflash_tokens_ > 0; }
     // Rebuild pager mapping after (re)prefill: positions [0, committed)
     // occupy pool slots identity-mapped (prefill is contiguous).
@@ -192,6 +193,10 @@ protected:
     void kvflash_upload_mask();
     // Drafter rescore + reselect every kvflash_tau_ generated tokens.
     void kvflash_maybe_reselect(int generated);
+    // Forced initial reselect at decode start: runs scorer + reselect
+    // unconditionally (no tau gate), bringing needle-chunk resident
+    // before the first answer token. Gated by DFLASH_KVFLASH_INITIAL_RESELECT.
+    void kvflash_force_reselect();
     // Attach the drafter scorer if a drafter path is configured and the
     // scorer is missing (lazy-loads the drafter on first need; also heals
     // after a residency release frees it). No-op without a path.
@@ -293,7 +298,10 @@ private:
                       const DaemonIO & io,
                       const BudgetHook & budget_hook = {},
                       bool * forced_close_out = nullptr,
-                      bool * degenerate_close_out = nullptr);
+                      bool * degenerate_close_out = nullptr,
+                      const std::vector<int32_t> * stall_tool_prefix_tokens = nullptr,
+                      const std::vector<int32_t> * stall_action_suffix_tokens = nullptr,
+                      const std::vector<int32_t> * stall_skip_tokens = nullptr);
 
     bool sync_remote_draft_features(int start_pos, int n_tokens);
 

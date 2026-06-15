@@ -121,6 +121,11 @@ static FILE * open_dflash_floor_log() {
     if (!out) ::close(fd);
     return out;
 }
+
+static bool dflash_colon_tool_guard() {
+    static const bool v = env_int_or_default("DFLASH_COLON_TOOL_GUARD", 0) != 0;
+    return v;
+}
 }  // namespace
 
 #define IS_EOS_TOK(tok, w)                                         \
@@ -256,6 +261,7 @@ bool Qwen35Backend::init() {
                                             kvf_budget);
     if (kvflash_tokens_ > 0) {
         kvflash_tau_ = std::max(1, env_int_or_default("DFLASH_KVFLASH_TAU", 64));
+        kvflash_initial_reselect_enabled_ = std::getenv("DFLASH_KVFLASH_INITIAL_RESELECT") != nullptr;
     }
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, /*ctx_alloc=*/kvflash_tokens_)) {
@@ -270,12 +276,13 @@ bool Qwen35Backend::init() {
             return false;
         }
         std::printf("[kvflash] resident pool %d tokens (logical max_ctx %d), "
-                    "tau=%d, policy=%s\n",
+                    "tau=%d, policy=%s, initial_reselect=%s\n",
                     kvflash_tokens_, cfg_.device.max_ctx, kvflash_tau_,
                     !kvflash_drafter_path_.empty()
                         ? "drafter (attaches on first reselect)"
                         : "lru (recency-only: no Qwen3-0.6B drafter found "
-                          "next to the model or in --prefill-drafter)");
+                          "next to the model or in --prefill-drafter)",
+                    kvflash_initial_reselect_enabled_ ? "on" : "off");
         std::fflush(stdout);
     }
 
@@ -804,6 +811,12 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     auto t_prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
 
+    // KVFlash initial reselect: bring needle-chunk resident before the
+    // first answer token so short answers can attend to mid-context info.
+    if (kvflash_initial_reselect_enabled_ && kvflash_active()) {
+        kvflash_force_reselect();
+    }
+
     // Decode (speculative)
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
@@ -818,7 +831,10 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
             decode_ok = do_ar_decode(committed, req.n_gen, result.tokens, out_io,
                                      req.budget_hook,
                                      &result.budget_forced_close,
-                                     &result.degenerate_decode_close);
+                                     &result.degenerate_decode_close,
+                                     req.stall_tool_prefix_tokens,
+                                     req.stall_action_suffix_tokens,
+                                     req.stall_skip_tokens);
             out_io.emit(-1);
         } else {
             decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
@@ -931,6 +947,12 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             std::chrono::steady_clock::now() - t_prefill_start).count();
     }
 
+    // KVFlash initial reselect: bring needle-chunk resident before the
+    // first answer token so short answers can attend to mid-context info.
+    if (kvflash_initial_reselect_enabled_ && kvflash_active()) {
+        kvflash_force_reselect();
+    }
+
     // Decode
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
@@ -945,7 +967,10 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             decode_ok = do_ar_decode(committed, req.n_gen, result.tokens, out_io,
                                      req.budget_hook,
                                      &result.budget_forced_close,
-                                     &result.degenerate_decode_close);
+                                     &result.degenerate_decode_close,
+                                     req.stall_tool_prefix_tokens,
+                                     req.stall_action_suffix_tokens,
+                                     req.stall_skip_tokens);
             out_io.emit(-1);
         } else {
             decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
@@ -1335,12 +1360,34 @@ void Qwen35Backend::kvflash_maybe_reselect(int generated) {
     }
 }
 
+void Qwen35Backend::kvflash_force_reselect() {
+    if (!kvflash_active()) return;
+    if (!kvflash_scorer_) kvflash_ensure_scorer();
+    if (!kvflash_scorer_) return;
+    if (!kvflash_scorer_->score_chunks(kvflash_history_, kvflash_pager_.chunk_tokens(), kvflash_scores_)) {
+        return;
+    }
+    kvflash_pager_.score_hook = [this](int c) {
+        return c < (int)kvflash_scores_.size() ? kvflash_scores_[c] : 1e30f;
+    };
+    const int events = kvflash_pager_.reselect();
+    if (events > 0) {
+        std::fprintf(stderr, "[kvflash] initial reselect: %d page events "
+                     "(resident %d/%d blocks)\n",
+                     events, kvflash_pager_.resident_blocks(),
+                     kvflash_tokens_ / kvflash_pager_.chunk_tokens());
+    }
+}
+
 bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                   std::vector<int32_t> & out_tokens,
                                   const DaemonIO & io,
                                   const BudgetHook & budget_hook,
                                   bool * forced_close_out,
-                                  bool * degenerate_close_out) {
+                                  bool * degenerate_close_out,
+                                  const std::vector<int32_t> * stall_tool_prefix_tokens,
+                                  const std::vector<int32_t> * stall_action_suffix_tokens,
+                                  const std::vector<int32_t> * stall_skip_tokens) {
     // Budget hook state.
     //   - budget_close_started: true once we've begun injecting the close
     //     sequence. Prevents re-triggering on continued forward generation.
@@ -1427,6 +1474,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     auto t_dec0_ar = std::chrono::steady_clock::now();
     const size_t out_tokens_at_entry = out_tokens.size();
     const int _min_floor = dflash_min_tokens_floor();
+    const bool kColonGuard = dflash_colon_tool_guard();
+    int colon_guard_fires = 0;
     static const int _repeat_guard = []{
         const int explicit_guard =
             env_int_or_default("DFLASH_DEGENERATE_RUN_TOKENS", -1);
@@ -1439,6 +1488,31 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     std::vector<float> logits_buf(vocab);
     std::vector<float> embed_buf_vec(hidden);
     float * embed_buf = embed_buf_vec.data();
+
+    auto embed_and_forward = [&](int32_t tok, int pos) -> bool {
+        if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
+        ggml_backend_tensor_set(sg_.inp_embed, embed_buf, 0, sizeof(float) * hidden);
+        int32_t pos4[4] = {pos, pos, pos, 0};
+        ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);
+        const bool pool = kvflash_active();
+        if (!build_target_step(sg_, w_, cache_, target_backend_,
+                               pos, 1, pool, false, false, 0, false,
+                               cfg_.kq_stride_pad, should_capture_moe_router(), pool))
+            return false;
+        if (sg_.kv_write_rows) {
+            const int n_head_kv = w_.n_head_kv;
+            const int64_t slot = pool ? (int64_t)kvflash_pager_.slot_for(pos) : (int64_t)pos;
+            if (pool && slot < 0) return false;
+            std::vector<int64_t> row_vals(n_head_kv, slot);
+            ggml_backend_tensor_set(sg_.kv_write_rows, row_vals.data(), 0,
+                                    sizeof(int64_t) * n_head_kv);
+        }
+        if (pool) kvflash_upload_mask();
+        auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
+        if (st != GGML_STATUS_SUCCESS) return false;
+        after_target_compute(sg_, pos, 1);
+        return true;
+    };
 
     // First token: consume the final prefill position.  Do not derive this
     // offset from committed/KV position: restore paths can prefill a delta at
@@ -1455,7 +1529,16 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     const int initial_emitted = out_tokens.empty() ? 1 : 0;
     if (initial_emitted == 1) {
         int32_t first_tok;
-        if (sampler_.needs_logit_processing()) {
+        if (kvflash_initial_reselect_enabled_ && kvflash_active()) {
+            // Re-forward the last committed token so its logits attend to
+            // the reselected resident set (needle now in-pool).
+            int32_t last_committed_tok = cache_.last_tok;
+            if (!embed_and_forward(last_committed_tok, committed - 1)) return false;
+            ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
+                                    sizeof(float) * vocab);
+            first_tok = sample_logits(logits_buf.data(), vocab, sampler_,
+                                      out_tokens, sampler_rng_);
+        } else if (sampler_.needs_logit_processing()) {
             if (!prefill_last_logits_valid_) return false;
             ggml_backend_tensor_get(sg_.logits, logits_buf.data(), prefill_last_logits_offset_,
                                     sizeof(float) * vocab);
@@ -1477,49 +1560,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     for (int i = initial_emitted; i < n_gen; i++) {
         int32_t tok = out_tokens.back();
 
-        if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
-        ggml_backend_tensor_set(sg_.inp_embed, embed_buf, 0, sizeof(float) * hidden);
-        int32_t pos4[4] = {committed, committed, committed, 0};
-        ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);
-
-        // kvflash: graph carries a slot-validity mask alongside the
-        // step-invariant set_rows write; the FA span clamps to the pool.
-        const bool pool = kvflash_active();
-        if (!build_target_step(sg_, w_, cache_, target_backend_,
-                               /*kv_start=*/committed, /*n_tokens=*/1,
-                               /*with_mask=*/pool, /*capture=*/false,
-                               /*capture_delta_intermediate=*/false,
-                               /*fa_window=*/0,
-                               /*last_token_logits_only=*/false,
-                               cfg_.kq_stride_pad,
-                               should_capture_moe_router(),
-                               /*kvflash_mask=*/pool)) {
-            return false;
-        }
-
-        // Fill kv_write_rows with this step's cache slot for set_rows:
-        // the logical position directly, or its pool slot in kvflash mode.
-        if (sg_.kv_write_rows) {
-            const int n_head_kv = w_.n_head_kv;
-            const int64_t slot = pool ? (int64_t)kvflash_pager_.slot_for(committed)
-                                      : (int64_t)committed;
-            if (pool && slot < 0) {
-                std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
-                                     "(pool %d exhausted)\n",
-                             committed, kvflash_tokens_);
-                set_last_error("kvflash: no evictable pool block");
-                return false;
-            }
-            std::vector<int64_t> row_vals(n_head_kv, slot);
-            ggml_backend_tensor_set(sg_.kv_write_rows, row_vals.data(), 0,
-                                    sizeof(int64_t) * n_head_kv);
-        }
-        if (pool) kvflash_upload_mask();
-
-        auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
-        if (st != GGML_STATUS_SUCCESS) return false;
-
-        after_target_compute(sg_, committed, 1);
+        if (!embed_and_forward(tok, committed)) return false;
 
         // GPU argmax: read 4 bytes, skip the 970 KB logit D2H. Escape: DFLASH_GPU_ARGMAX=0.
         static const bool kGpuArgmaxAR = []() {
@@ -1570,13 +1611,42 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             }
         }
 
+        // Colon-aware tool-prefix injection (independent of _min_floor).
+        if (kColonGuard && IS_EOS_TOK(next_tok, w_) &&
+            stall_tool_prefix_tokens && !stall_tool_prefix_tokens->empty() &&
+            stall_action_suffix_tokens && !stall_action_suffix_tokens->empty() &&
+            tokens_have_recent_any(out_tokens, *stall_action_suffix_tokens, 16) &&
+            !(stall_skip_tokens &&
+              tokens_contain_recent_sequence(out_tokens, *stall_skip_tokens, 64))) {
+            if (colon_guard_fires < 3) {
+                colon_guard_fires++;
+                FILE* _d = open_dflash_floor_log();
+                if (_d) {
+                    std::fprintf(_d, "[ar-tool-floor] eos@%zu prefix=%zu -> inject\n",
+                                 out_tokens.size(), stall_tool_prefix_tokens->size());
+                    std::fclose(_d);
+                }
+                for (size_t pi = 0; pi < stall_tool_prefix_tokens->size(); ++pi) {
+                    int32_t ptok = (*stall_tool_prefix_tokens)[pi];
+                    if (!embed_and_forward(ptok, committed)) return false;
+                    out_tokens.push_back(ptok);
+                    io.emit(ptok);
+                    if (kvflash_active()) kvflash_history_.push_back(ptok);
+                    committed++;
+                    cache_.cur_pos = committed;
+                }
+                cache_.last_tok = out_tokens.back();
+                continue;
+            }
+        }
+
         maybe_force_close(next_tok, committed);
 
         out_tokens.push_back(next_tok);
         io.emit(next_tok);
         committed++;
         cache_.cur_pos = committed;
-        if (pool) {
+        if (kvflash_active()) {
             kvflash_history_.push_back(next_tok);
             kvflash_maybe_reselect((int)(out_tokens.size() - out_tokens_at_entry));
         }
@@ -1887,23 +1957,66 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // still fires when spec-decode is unavailable.
         bool ok = do_ar_decode(committed, n_gen, out_tokens, io,
                                 budget_hook ? *budget_hook : BudgetHook{},
-                                forced_close_out, degenerate_close_out);
+                                forced_close_out, degenerate_close_out,
+                                stall_tool_prefix_tokens,
+                                stall_action_suffix_tokens,
+                                stall_skip_tokens);
         io.emit(-1);
         return ok;
     }
 
     out_spec_ran = true;
 
+    // Embed+forward lambda for re-forwarding the first token when initial
+    // reselect is active (same logic as do_ar_decode's embed_and_forward).
+    const int vocab = w_.n_vocab;
+    std::vector<float> embed_buf_vec(hidden);
+    float * embed_buf = embed_buf_vec.data();
+    auto embed_and_forward = [&](int32_t tok, int pos) -> bool {
+        if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
+        ggml_backend_tensor_set(sg_.inp_embed, embed_buf, 0, sizeof(float) * hidden);
+        int32_t pos4[4] = {pos, pos, pos, 0};
+        ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);
+        const bool pool = kvflash_active();
+        if (!build_target_step(sg_, w_, cache_, target_backend_,
+                               pos, 1, pool, false, false, 0, false,
+                               cfg_.kq_stride_pad, should_capture_moe_router(), pool))
+            return false;
+        if (sg_.kv_write_rows) {
+            const int n_head_kv = w_.n_head_kv;
+            const int64_t slot = pool ? (int64_t)kvflash_pager_.slot_for(pos) : (int64_t)pos;
+            if (pool && slot < 0) return false;
+            std::vector<int64_t> row_vals(n_head_kv, slot);
+            ggml_backend_tensor_set(sg_.kv_write_rows, row_vals.data(), 0,
+                                    sizeof(int64_t) * n_head_kv);
+        }
+        if (pool) kvflash_upload_mask();
+        auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
+        if (st != GGML_STATUS_SUCCESS) return false;
+        after_target_compute(sg_, pos, 1);
+        return true;
+    };
+
     // Sampled-verify: cache_.last_tok is do_prefill's argmax, and the spec
     // loop commits it verbatim as the first generated token. The first token
     // is the highest-entropy decision of the whole generation (e.g. "answer
     // with text" vs "open a tool call"), so it must be sampled like every
     // other committed token — mirror do_ar_decode's first-token sampling.
-    if (sampled_verify && out_tokens.empty() && prefill_last_logits_valid_) {
+    if (sampled_verify && out_tokens.empty() &&
+        (prefill_last_logits_valid_ || (kvflash_initial_reselect_enabled_ && kvflash_active()))) {
         std::vector<float> first_logits(w_.n_vocab);
-        ggml_backend_tensor_get(sg_.logits, first_logits.data(),
-                                prefill_last_logits_offset_,
-                                sizeof(float) * (size_t)w_.n_vocab);
+        if (kvflash_initial_reselect_enabled_ && kvflash_active()) {
+            // Re-forward the last committed token so its logits attend to
+            // the reselected resident set (needle now in-pool).
+            int32_t last_committed_tok = cache_.last_tok;
+            if (!embed_and_forward(last_committed_tok, committed - 1)) return false;
+            ggml_backend_tensor_get(sg_.logits, first_logits.data(), 0,
+                                    sizeof(float) * (size_t)w_.n_vocab);
+        } else {
+            ggml_backend_tensor_get(sg_.logits, first_logits.data(),
+                                    prefill_last_logits_offset_,
+                                    sizeof(float) * (size_t)w_.n_vocab);
+        }
         if (std::getenv("DFLASH_SV_DEBUG")) {
             int am = 0; float best = first_logits[0];
             for (int v = 1; v < w_.n_vocab; v++)
@@ -1919,6 +2032,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     }
 
     const int _min_floor = dflash_min_tokens_floor();
+    const bool kColonGuard = dflash_colon_tool_guard();
 
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
 
@@ -1977,7 +2091,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
-                                    degenerate_close_out);
+                                    degenerate_close_out,
+                                    stall_tool_prefix_tokens,
+                                    stall_action_suffix_tokens,
+                                    stall_skip_tokens);
             io.emit(-1);
             return ok;
         }
@@ -2319,9 +2436,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         constexpr size_t kActionSuffixLookback = 16;
         constexpr size_t kSkipSequenceLookback = 64;
         int emitted = 0;
+        int colon_guard_fires = 0;
         for (int i = 0; i < commit_n; i++) {
-            if (_min_floor > 0 && (int)out_tokens.size() < _min_floor &&
-                IS_EOS_TOK(replay_tok[i], w_)) {
+            const bool floor_window = (_min_floor > 0 && (int)out_tokens.size() < _min_floor);
+            if (((floor_window || (kColonGuard && colon_guard_fires < 3)))
+                && IS_EOS_TOK(replay_tok[i], w_)) {
                 // Action preambles often end as "I'll check:\n\n" before EOS.
                 // Tokenization makes the colon several tokens back, so keep a
                 // modest trailing window while still requiring a recent action
@@ -2336,6 +2455,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                                      *stall_skip_tokens,
                                                      kSkipSequenceLookback));
                 if (can_inject_tool) {
+                    colon_guard_fires++;
                     // Debug-only diagnostic, same DFLASH_MIN_TOKENS gating as the
                     // AR-path floor log above; silent in the default lane.
                     FILE* _d = open_dflash_floor_log();
@@ -2470,7 +2590,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
-                                    degenerate_close_out);
+                                    degenerate_close_out,
+                                    stall_tool_prefix_tokens,
+                                    stall_action_suffix_tokens,
+                                    stall_skip_tokens);
             io.emit(-1);
             return ok;
         }
@@ -2511,7 +2634,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             tail_hook.close_token_ids.clear();
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
-                                    degenerate_close_out);
+                                    degenerate_close_out,
+                                    stall_tool_prefix_tokens,
+                                    stall_action_suffix_tokens,
+                                    stall_skip_tokens);
             io.emit(-1);
             return ok;
         }
