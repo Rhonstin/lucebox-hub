@@ -62,12 +62,13 @@ export DFLASH_FLOWKV_TOOLS="${DFLASH_FLOWKV_TOOLS:-0}"  # DISABLED 2026-06-15: s
 export DFLASH_COLON_TOOL_GUARD="${DFLASH_COLON_TOOL_GUARD:-0}"  # DISABLED 2026-06-15: caused emoji-loop degeneration on legitimate colon-ending text turns
 export DFLASH_STALL_TOOL_PREFIX="${DFLASH_STALL_TOOL_PREFIX:-0}"  # DISABLED with colon-guard
 
-# Full-cache mode (no PFlash, no KVFlash): keep the whole context in a full
-# q8_0 KV cache (fits 256K = ~4.6 GB on the 24 GB card) so attention is
-# complete and retrieval is flawless. Fast prefill comes from REUSE — the
-# disk/prefix cache (--kv-cache-dir) restores the stable history prefix on
-# append-only turns, so only the new tokens prefill. Compression (if ever
-# needed near the 256K cap) is done externally (Hermes), not here.
+# Full-cache mode (no PFlash, no KVFlash): full q8_0 KV so attention is
+# complete and retrieval flawless. Capped at 128K — q8_0 KV at 256K wants
+# ~9 GB and OOMs alongside weights + decode draft + ddtree rollback on the
+# 24 GB card (256K needs KVFlash or external compaction). 128K full = ~4.5 GB
+# KV, ~21.7 GB total, well above real 40-60K agent traffic. Fast prefill from
+# REUSE: --kv-cache-dir restores the stable history prefix on append-only
+# turns, only new tokens prefill. Compress old context externally (Hermes).
 exec "$BIN" "$MODELS/Qwen3.6-27B-Q4_K_M.gguf" \
   --draft "$MODELS/dflash-draft-3.6-q4_k_m.gguf" \
   --draft-swa 2048 \
