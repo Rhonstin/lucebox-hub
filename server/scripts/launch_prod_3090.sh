@@ -62,20 +62,21 @@ export DFLASH_FLOWKV_TOOLS="${DFLASH_FLOWKV_TOOLS:-0}"  # DISABLED 2026-06-15: s
 export DFLASH_COLON_TOOL_GUARD="${DFLASH_COLON_TOOL_GUARD:-0}"  # DISABLED 2026-06-15: caused emoji-loop degeneration on legitimate colon-ending text turns
 export DFLASH_STALL_TOOL_PREFIX="${DFLASH_STALL_TOOL_PREFIX:-0}"  # DISABLED with colon-guard
 
+# Full-cache mode (no PFlash, no KVFlash): keep the whole context in a full
+# q8_0 KV cache (fits 256K = ~4.6 GB on the 24 GB card) so attention is
+# complete and retrieval is flawless. Fast prefill comes from REUSE — the
+# disk/prefix cache (--kv-cache-dir) restores the stable history prefix on
+# append-only turns, so only the new tokens prefill. Compression (if ever
+# needed near the 256K cap) is done externally (Hermes), not here.
 exec "$BIN" "$MODELS/Qwen3.6-27B-Q4_K_M.gguf" \
   --draft "$MODELS/dflash-draft-3.6-q4_k_m.gguf" \
   --draft-swa 2048 \
   --host 0.0.0.0 --port "$PORT" \
-  --max-ctx 114688 \
+  --max-ctx 262144 \
   --chunk 256 \
   --fa-window 0 \
-  --cache-type-k q4_0 --cache-type-v q4_0 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
   --ddtree --ddtree-budget 22 \
-  --prefill-compression auto \
-  --prefill-threshold 16000 \
-  --prefill-curve 16000:0.5 40000:0.2 100000:0.1 139264:0.05 \
-  --prefill-drafter "$MODELS/Qwen3-0.6B-BF16.gguf" \
-  --draft-residency request-scoped \
   --kv-cache-dir /mnt/models/.cache/dflash-kv \
   --kv-cache-budget 16384 \
   --model-name qwen3.6-27b
